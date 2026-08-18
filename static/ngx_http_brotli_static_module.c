@@ -244,6 +244,13 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   ngx_str_set(&content_encoding_entry->value, kEncoding);
   req->headers_out.content_encoding = content_encoding_entry;
 
+  /* gzip_static parity: byte ranges address the selected representation
+   * (RFC 9110 §14.2) — the .br bytes on disk — which a client can fetch,
+   * resume and concatenate coherently because the validator is strong and
+   * the bytes are stable. Ranges only work by opting in: the range filter
+   * bails unless allow_ranges is set. */
+  req->allow_ranges = 1;
+
   /* Setup response body. */
   buf = ngx_pcalloc(req->pool, sizeof(ngx_buf_t));
   if (buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -254,6 +261,10 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   buf->in_file = buf->file_last ? 1 : 0;
   buf->last_buf = (req == req->main) ? 1 : 0;
   buf->last_in_chain = 1;
+  /* An empty sidecar in a subrequest leaves in_file and last_buf both 0;
+   * sync marks the flagless zero-size buf deliberate so the output chain
+   * does not alert "zero size buf" (gzip_static parity). */
+  buf->sync = (buf->last_buf || buf->in_file) ? 0 : 1;
   buf->file->fd = file_info.fd;
   buf->file->name = path;
   buf->file->log = log;

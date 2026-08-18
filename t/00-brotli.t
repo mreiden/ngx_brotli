@@ -411,3 +411,83 @@ GET /st/hello.js
 Content-Encoding: br
 --- no_error_log
 [error]
+
+
+
+=== TEST 16: a served .br sidecar advertises Accept-Ranges: bytes
+# gzip_static parity: static-side byte ranges address the selected
+# representation (RFC 9110 §14.2) — the .br bytes on disk — and only
+# work by opting in via r->allow_ranges (the range filter bails
+# without it). gzip_static has always set it; this module never did,
+# so ranges silently never worked. Fails on the unfixed module: no
+# opt-in, no header.
+--- config
+    location /st/ {
+        brotli_static on;
+        gzip_vary on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Accept-Ranges: bytes
+--- no_error_log
+[error]
+
+
+
+=== TEST 17: byte ranges slice the .br sidecar's bytes (206 + Content-Range)
+# The representation is the encoded bytes and the validator is strong,
+# so a client can fetch, resume and concatenate ranges coherently —
+# resumable downloads of precompressed assets, same as gzip_static.
+# Unfixed code ignores Range and answers 200 with the full body.
+--- config
+    location /st/ {
+        brotli_static on;
+        gzip_vary on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br
+Range: bytes=0-9
+--- error_code: 206
+--- response_headers eval
+"Content-Range: bytes 0-9/" . length($::br)
+--- response_body eval
+substr($::br, 0, 10)
+--- no_error_log
+[error]
+
+
+
+=== TEST 18: an empty .br sidecar behind an SSI include ships silently
+# In a subrequest in_file and last_buf are both 0, so an empty sidecar
+# produces a flagless zero-size buf that trips the output chain's
+# "zero size buf" alert without buf->sync (gzip_static sets it; this
+# module didn't). brotli_static has no content probe, so an empty .br
+# is servable and this path is live — unlike the sibling zstd module,
+# whose frame probe rejects sub-4-byte files before serving.
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;   # the SSI filter only touches ssi_types
+    }
+    location /inc/ {
+        brotli_static always;
+    }
+--- user_files eval
+[ [ "page/x.shtml" => qq{before[<!--#include virtual="/inc/empty.txt" -->]after\n} ],
+  [ "inc/empty.txt.br" => "" ] ]
+--- request
+GET /page/x.shtml
+--- response_body
+before[]after
+--- no_error_log eval
+qr/zero size buf/
