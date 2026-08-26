@@ -491,3 +491,28 @@ GET /page/x.shtml
 before[]after
 --- no_error_log eval
 qr/zero size buf/
+
+
+
+=== TEST 19: HEAD fast path keeps the negotiated headers, sends no body
+# Parent nginx-zstd-module #179: a HEAD returns after ngx_http_send_header(),
+# skipping the body buffer + ngx_file_t allocations — but Content-Encoding
+# and the Vary line (set before the fast path) must match what the GET
+# produces.
+--- config
+    location /st/ {
+        brotli_static on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+HEAD /st/hello.js
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+Accept-Ranges: bytes
+--- response_body
+--- no_error_log
+[error]

@@ -247,6 +247,16 @@ static ngx_int_t handler(ngx_http_request_t* req) {
    * bails unless allow_ranges is set. */
   req->allow_ranges = 1;
 
+  /* HEAD fast path (parent nginx-zstd-module #179): the response headers
+     already carry everything a HEAD needs — Content-Encoding and the Vary
+     line are set above — so send them and skip the body ngx_buf_t +
+     ngx_file_t allocations below. Strict NGX_HTTP_HEAD, not
+     req->header_only, which also covers 304/204 whose existing
+     header_only return past the body setup stays correct. */
+  if (req->method == NGX_HTTP_HEAD) {
+    return ngx_http_send_header(req);
+  }
+
   /* Setup response body. */
   buf = ngx_pcalloc(req->pool, sizeof(ngx_buf_t));
   if (buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
