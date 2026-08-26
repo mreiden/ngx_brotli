@@ -18,10 +18,25 @@ if (defined $ENV{'TEST_NGINX_BINARY'}) {
 
 add_block_preprocessor(sub {
     my $block = shift;
-    return if !@dynamic_modules;
 
-    my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
-    $block->set_value("main_config", $main_config);
+    if (@dynamic_modules) {
+        my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
+        $block->set_value("main_config", $main_config);
+    }
+
+    # RFC 9842 section 8 secure-context gate (#158): dcb is only elected on
+    # a secure context, and Test::Nginx::Socket has no TLS client — every
+    # connection here is cleartext. So the negotiation blocks below, which
+    # model a normal HTTPS deployment, run behind an http-level
+    # brotli_dcb_assume_secure_transport (the TLS-terminating-proxy
+    # acknowledgement) injected here. Blocks whose name contains
+    # "secure-context" opt OUT and see the real fail-closed default.
+    unless (defined($block->name) && $block->name =~ /secure-context/) {
+        my $hc = $block->http_config;
+        $hc = defined($hc) ? $hc : '';
+        $block->set_value("http_config",
+                          "brotli_dcb_assume_secure_transport on;\n$hc");
+    }
 });
 
 # The negotiation key is the SHA-256 of the dictionary fixture, computed
@@ -72,7 +87,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcb
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary
 --- no_error_log
 [error]
 
@@ -93,7 +108,7 @@ GET /t
 Accept-Encoding: br, dcb
 --- response_headers
 Content-Encoding: br
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary
 --- no_error_log
 [error]
 
@@ -281,7 +296,7 @@ GET /t
 "Accept-Encoding: dcb\nAvailable-Dictionary: :$::bad_b64:"
 --- response_headers
 !Content-Encoding
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary
 --- no_error_log
 [error]
 
@@ -372,7 +387,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcb
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary
 --- no_error_log
 [error]
 
@@ -460,3 +475,76 @@ GET /t
 non-hex character
 --- no_error_log
 [alert]
+
+
+
+=== TEST 20: secure-context default fail-closed — dcb declines over cleartext
+# No acknowledgement (this block opts out of the injected one via its
+# name), and Test::Nginx speaks cleartext, so RFC 9842 section 8 refuses
+# the dictionary coding: the response falls back to plain br. The Vary
+# line is still emitted (the location varies on Available-Dictionary).
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js;
+        default_type text/html;
+        return 200 "dcb negotiation body: hello widget compute render text\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding, Available-Dictionary
+--- no_error_log
+[error]
+
+
+
+=== TEST 21: secure-context X-Forwarded-Proto https does NOT re-enable dcb
+# The gate is transport, never a client-settable header: a forwarded
+# scheme claim on a directly reachable listener must not switch dcb back
+# on over cleartext.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js;
+        default_type text/html;
+        return 200 "dcb negotiation body: hello widget compute render text\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:\nX-Forwarded-Proto: https"
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+
+=== TEST 22: secure-context acknowledgement at location level re-enables dcb
+# Proves the opt-in path itself: this block opts out of the injected
+# http-level ack and sets the directive in the location, so dcb elects —
+# the TLS-terminating-proxy deployment.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_assume_secure_transport on;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js;
+        default_type text/html;
+        return 200 "dcb negotiation body: hello widget compute render text\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: dcb
+Vary: Accept-Encoding, Available-Dictionary
+--- no_error_log
+[error]

@@ -21,16 +21,6 @@ typedef struct {
   ngx_uint_t enable;
 } configuration_t;
 
-/* Main (http-level) configuration. Cycle-owned on purpose: a rejected
-   reload takes this state down with its pool. */
-typedef struct {
-  /* Locations where the gzip_vary-off warning was withheld because a
-     compression_vary module is loaded (see merge_conf); reported as
-     one summary warning from postconfiguration instead of per
-     location. Mirrors the filter module's counter. */
-  ngx_uint_t vary_warn_suppressed;
-} main_configuration_t;
-
 static ngx_conf_enum_t kBrotliStaticEnum[] = {
     {ngx_string("off"), NGX_HTTP_BROTLI_STATIC_OFF},
     {ngx_string("on"), NGX_HTTP_BROTLI_STATIC_ON},
@@ -42,7 +32,6 @@ static ngx_conf_enum_t kBrotliStaticEnum[] = {
 /* >> Forward declarations */
 
 static ngx_int_t handler(ngx_http_request_t* req);
-static void* create_main_conf(ngx_conf_t* root_cfg);
 static void* create_conf(ngx_conf_t* root_cfg);
 static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child);
 static ngx_int_t init(ngx_conf_t* root_cfg);
@@ -63,7 +52,7 @@ static ngx_http_module_t kModuleContext = {
     NULL, /* preconfiguration */
     init, /* postconfiguration */
 
-    create_main_conf, /* create main configuration */
+    NULL, /* create main configuration */
     NULL, /* init main configuration */
 
     NULL, /* create server configuration */
@@ -134,8 +123,15 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ALWAYS) {
     /* Ignore request properties (e.g. Accept-Encoding). */
   } else {
-    /* NGX_HTTP_BROTLI_STATIC_ON */
-    req->gzip_vary = 1;
+    /* NGX_HTTP_BROTLI_STATIC_ON: emit Vary: Accept-Encoding by
+       construction (parent #163), not via r->gzip_vary — whose backing
+       "gzip_vary" directive defaults to off, under which no Vary is
+       emitted and a shared cache could serve .br to a client that cannot
+       decode it. "always" mode stays exempt: it ignores Accept-Encoding,
+       so the response genuinely does not vary on it. */
+    if (ngx_http_brotli_vary_accept_encoding(req) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     rc = check_eligility(req);
     if (rc != NGX_OK) return NGX_DECLINED;
   }
@@ -282,11 +278,6 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   return ngx_http_output_filter(req, &out);
 }
 
-static void* create_main_conf(ngx_conf_t* root_cfg) {
-  /* pcalloc zeroes vary_warn_suppressed — no reset hook needed. */
-  return ngx_pcalloc(root_cfg->pool, sizeof(main_configuration_t));
-}
-
 static void* create_conf(ngx_conf_t* root_cfg) {
   configuration_t* cfg;
   cfg = ngx_palloc(root_cfg->pool, sizeof(configuration_t));
@@ -301,37 +292,10 @@ static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child) {
   ngx_conf_merge_uint_value(cfg->enable, prev->enable,
                             NGX_HTTP_BROTLI_STATIC_OFF);
 
-  /* "on" mode picks .br vs the plain file by Accept-Encoding, so the
-     response varies on it and a shared cache must key on it — nginx only
-     emits Vary: Accept-Encoding when the core gzip_vary is on. "always"
-     is deliberately exempt: it serves .br regardless of Accept-Encoding,
-     so the response genuinely does not vary. Same check as the zstd
-     sibling modules. When the compression_vary filter module is loaded
-     — it emits the header from r->gzip_vary without needing "gzip_vary
-     on" — the per-location warning is withheld and counted instead;
-     presence alone cannot prove it is enabled here (see
-     ngx_http_brotli_vary_handled_externally()), so postconfiguration
-     reports one summary warning. */
-  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
-    ngx_http_core_loc_conf_t* clcf =
-        ngx_http_conf_get_module_loc_conf(root_cfg, ngx_http_core_module);
-    if (clcf != NULL && !clcf->gzip_vary) {
-      if (ngx_http_brotli_vary_handled_externally(root_cfg)) {
-        main_configuration_t* main_cfg = ngx_http_conf_get_module_main_conf(
-            root_cfg, ngx_http_brotli_static_module);
-        if (main_cfg != NULL) {
-          main_cfg->vary_warn_suppressed++;
-        }
-      } else {
-        ngx_conf_log_error(NGX_LOG_WARN, root_cfg, 0,
-                           "brotli_static is enabled but \"gzip_vary\" is "
-                           "off; add \"gzip_vary on\" to emit "
-                           "\"Vary: Accept-Encoding\" so proxies and CDNs "
-                           "cache compressed and uncompressed responses "
-                           "separately");
-      }
-    }
-  }
+  /* No gzip_vary-off warning here anymore (parent #163): the "on"-mode
+     handler emits "Vary: Accept-Encoding" itself via
+     ngx_http_brotli_vary_accept_encoding(), so correctness no longer
+     depends on "gzip_vary on" and the warning would be misleading. */
 
   return NGX_CONF_OK;
 }
@@ -339,26 +303,6 @@ static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child) {
 static ngx_int_t init(ngx_conf_t* root_cfg) {
   ngx_http_core_main_conf_t* core_cfg;
   ngx_http_handler_pt* handler_slot;
-  main_configuration_t* main_cfg;
-
-  /* The per-location gzip_vary-off warnings withheld in merge_conf,
-     folded into one line — see the filter module's postconfiguration
-     for why this stays a warning rather than going silent
-     (compression_vary defaults to off, and another module's merged
-     conf cannot be read to check). */
-  main_cfg = ngx_http_conf_get_module_main_conf(root_cfg,
-                                                ngx_http_brotli_static_module);
-  if (main_cfg != NULL && main_cfg->vary_warn_suppressed) {
-    ngx_conf_log_error(NGX_LOG_WARN, root_cfg, 0,
-                       "brotli_static is enabled with \"gzip_vary\" off in "
-                       "%ui location(s); the per-location warnings are "
-                       "suppressed because "
-                       "ngx_http_compression_vary_filter_module is loaded, "
-                       "but its \"compression_vary\" directive defaults to "
-                       "off; verify \"compression_vary on\" covers those "
-                       "locations so \"Vary: Accept-Encoding\" is emitted",
-                       main_cfg->vary_warn_suppressed);
-  }
 
   core_cfg = ngx_http_conf_get_module_main_conf(root_cfg, ngx_http_core_module);
   handler_slot =

@@ -231,7 +231,7 @@ GET /t
 Accept-Encoding: br
 --- response_headers
 Content-Encoding: br
-Vary: X-No-Br
+Vary: X-No-Br, Accept-Encoding
 --- no_error_log
 [error]
 
@@ -296,11 +296,10 @@ Content-Encoding: br
 
 
 
-=== TEST 12a: enabled without gzip_vary warns at config load
-# Whether the response is br or identity depends on Accept-Encoding;
-# without Vary a shared cache can serve the compressed variant to a
-# client that cannot decode it. Same check as the zstd siblings — it
-# catches stale "gzip_vary off" workarounds in old configs.
+=== TEST 12a: enabled without gzip_vary emits Vary by construction, no warn
+# Parent #163: the response is br or identity by Accept-Encoding, so the
+# header filter emits "Vary: Accept-Encoding" itself — correctness no
+# longer depends on "gzip_vary on", and there is no gzip_vary-off warning.
 --- config
     location /t {
         brotli on;
@@ -312,10 +311,11 @@ Content-Encoding: br
 GET /t
 --- more_headers
 Accept-Encoding: br
---- error_log
-"gzip_vary" is off
---- no_error_log
-[error]
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+--- no_error_log eval
+[qr/"gzip_vary" is off/, qr/\[error\]/]
 
 
 

@@ -81,6 +81,17 @@ typedef struct {
   /* RFC 9842 dictionaries (ngx_http_brotli_dcb_dict_t). */
   ngx_array_t* dcb_dicts;
 
+  /* RFC 9842 secure-context gate. A dcb response is only offered on a
+     secure context: over cleartext, dictionary compression hands a
+     network attacker a length oracle over content the dictionary already
+     describes (RFC 9842 section 8). Secure means this nginx terminates
+     TLS (r->connection->ssl != NULL); off by default. When a
+     TLS-terminating proxy fronts nginx (ssl NULL here),
+     brotli_dcb_assume_secure_transport on asserts the hop the client
+     actually spoke was secure — an operator acknowledgement, never
+     inferred from X-Forwarded-Proto or any client-settable header. */
+  ngx_flag_t dcb_assume_secure;
+
   ngx_bufs_t deprecated_unused_bufs;
 
   /* Brotli encoder parameter: quality */
@@ -89,17 +100,6 @@ typedef struct {
   /* Brotli encoder parameter: (max) lg_win */
   size_t lg_win;
 } ngx_http_brotli_conf_t;
-
-/* Main (http-level) configuration. Cycle-owned on purpose: a rejected
-   reload takes this state down with its pool (the same reasoning as
-   the zstd sibling's dcz counter). */
-typedef struct {
-  /* Locations where the gzip_vary-off warning was withheld because a
-     compression_vary module is loaded (see merge_conf); reported as
-     one summary warning from postconfiguration instead of per
-     location. */
-  ngx_uint_t vary_warn_suppressed;
-} ngx_http_brotli_main_conf_t;
 
 /* Instance context. */
 typedef struct {
@@ -172,7 +172,6 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
                                                 uintptr_t data);
 
-static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf);
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf);
 static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
                                         void* child);
@@ -261,6 +260,12 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
          NGX_CONF_TAKE12,
      ngx_http_brotli_dcb_dict_file, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL},
 
+    {ngx_string("brotli_dcb_assume_secure_transport"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_FLAG,
+     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_brotli_conf_t, dcb_assume_secure), NULL},
+
     ngx_null_command};
 
 /* Module context hooks. */
@@ -268,7 +273,7 @@ static ngx_http_module_t ngx_http_brotli_filter_module_ctx = {
     ngx_http_brotli_add_variables, /* pre-configuration */
     ngx_http_brotli_filter_init,   /* post-configuration */
 
-    ngx_http_brotli_create_main_conf, /* create main configuration */
+    NULL, /* create main configuration */
     NULL, /* init main configuration */
 
     NULL, /* create server configuration */
@@ -392,19 +397,32 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     return ngx_http_next_header_filter(r);
   }
 
-  r->gzip_vary = 1;
+  /* Vary emitted by this module rather than merely requested via
+     r->gzip_vary and left to the operator's "gzip_vary" directive —
+     whose default is OFF, under which nginx clears the flag and emits
+     nothing, so a negotiated response ships with no Vary and a shared
+     cache serves the compressed body to a client that cannot decode it
+     (parent nginx-zstd-module #163). Every path below negotiates on
+     Accept-Encoding (plain br, dcb, and the identity fallbacks), so the
+     line must be present. Placed below the bypass return, matching the
+     sibling unified module's ordering: the bypassed identity path carries
+     its cache-key dimension through the brotli_bypass_vary push above.
 
-  /* With dictionaries configured, WHICH encoding this location serves
-     depends on the request's Available-Dictionary header — the dcb
-     variant, the plain br variant a dictionary-less client receives, and
-     the identity fallback (a client sending "Accept-Encoding: dcb" only,
-     with a hash we do not hold, gets identity NOW but dcb once it
-     acquires a dictionary we do hold). A shared cache must key all of
-     them on that header. This push therefore sits ABOVE the acceptance
-     gate: every earlier return declines for reasons invariant in
-     Available-Dictionary; the paths below are not invariant. (This exact
-     ordering was a review finding on the sibling dcz implementation —
-     nginx-zstd-module PR #92 — baked in here from the start.) */
+     With dictionaries configured, the response ALSO varies on
+     Available-Dictionary (the dcb variant, the plain-br variant a
+     dictionary-less client gets, and the identity fallback are all keyed
+     on it). Emit ONE combined "Vary: Accept-Encoding, Available-Dictionary"
+     rather than a delegated Accept-Encoding line plus a separate literal
+     Available-Dictionary line: two Vary lines are legal per RFC 9110, but
+     a fair number of intermediary caches key on the FIRST line only —
+     exactly the hazard this header exists to prevent. The combined-line
+     branch does NOT set r->gzip_vary, so the core emitter cannot add a
+     second Accept-Encoding line beside it.
+
+     (Sec-Fetch-Site is a dcb response-selection input too — dcb_negotiate
+     refuses any value other than same-origin/none — and belongs in this
+     line as well; adding it is the separate #160 sync, deliberately left
+     out of this Vary-by-construction change.) */
   if (conf->dcb_dicts != NULL && conf->dcb_dicts->nelts > 0) {
     ngx_table_elt_t* v;
 
@@ -418,7 +436,10 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     v->next = NULL;
 #endif
     ngx_str_set(&v->key, "Vary");
-    ngx_str_set(&v->value, "Available-Dictionary");
+    ngx_str_set(&v->value, "Accept-Encoding, Available-Dictionary");
+
+  } else if (ngx_http_brotli_vary_accept_encoding(r) != NGX_OK) {
+    return NGX_ERROR;
   }
 
   /* RFC 9842 dcb negotiation first: a client that advertises a
@@ -938,6 +959,37 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     return NULL;
   }
 
+  /* RFC 9842 section 8 secure-context gate, fail-closed and ahead of the
+     header parsing: no dcb response over a non-secure connection, because
+     a dictionary-compressed response over cleartext is a length oracle
+     over content the dictionary already describes. Secure means this
+     nginx terminates TLS. The guard mirrors ngx_connection_t's own
+     condition for the ssl member (#if (NGX_SSL || NGX_COMPAT)), not
+     NGX_SSL alone, so a --with-compat build (where the field exists and
+     is always NULL) reads it correctly. HTTP/2 and HTTP/3 both carry a
+     non-NULL connection->ssl. A TLS-terminating proxy makes ssl NULL
+     here; brotli_dcb_assume_secure_transport on opts back in — an
+     operator acknowledgement, never inferred from a client-settable
+     forwarded-scheme header. */
+  if (!conf->dcb_assume_secure) {
+    ngx_flag_t secure;
+
+#if (NGX_SSL || NGX_COMPAT)
+    secure = (r->connection->ssl != NULL);
+#else
+    secure = 0;
+#endif
+
+    if (!secure) {
+      ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                     "brotli dcb: skip, not a secure context (RFC 9842 "
+                     "section 8); set "
+                     "\"brotli_dcb_assume_secure_transport on\" if TLS "
+                     "terminates upstream");
+      return NULL;
+    }
+  }
+
   ae = r->headers_in.accept_encoding;
   if (ae == NULL) {
     return NULL;
@@ -1089,11 +1141,6 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
   return NGX_OK;
 }
 
-static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
-  /* pcalloc zeroes vary_warn_suppressed — no reset hook needed. */
-  return ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_main_conf_t));
-}
-
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   ngx_http_brotli_conf_t* conf;
 
@@ -1115,6 +1162,7 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   conf->max_length = NGX_CONF_UNSET;
   conf->bypass = NGX_CONF_UNSET_PTR;
   conf->dcb_dicts = NGX_CONF_UNSET_PTR;
+  conf->dcb_assume_secure = NGX_CONF_UNSET;
 
   return conf;
 }
@@ -1133,6 +1181,7 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
   ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
   ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+  ngx_conf_merge_value(conf->dcb_assume_secure, prev->dcb_assume_secure, 0);
 
   /* a location declaring its own brotli_dcb_dict_file list replaces the
      inherited one wholesale (standard nginx array-directive semantics) */
@@ -1156,68 +1205,19 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
     return NGX_CONF_ERROR;
   }
 
-  /* Whether a response here is br or identity depends on the request's
-     Accept-Encoding; without Vary: Accept-Encoding a shared cache can
-     hand the compressed variant to a client that cannot decode it.
-     nginx only emits that header when the core gzip_vary is on, so warn
-     per merged location — the same check the zstd sibling modules ship,
-     which has caught real stale "gzip_vary off" workarounds in configs
-     predating correct Vary handling in caches. When the
-     compression_vary filter module is loaded — it emits the header
-     from r->gzip_vary without needing "gzip_vary on" — the
-     per-location warning is withheld and counted instead; presence
-     alone cannot prove it is enabled here (see
-     ngx_http_brotli_vary_handled_externally()), so postconfiguration
-     reports one summary warning. */
-  if (conf->enable) {
-    ngx_http_core_loc_conf_t* clcf =
-        ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    if (clcf != NULL && !clcf->gzip_vary) {
-      if (ngx_http_brotli_vary_handled_externally(cf)) {
-        ngx_http_brotli_main_conf_t* bmcf = ngx_http_conf_get_module_main_conf(
-            cf, ngx_http_brotli_filter_module);
-        if (bmcf != NULL) {
-          bmcf->vary_warn_suppressed++;
-        }
-      } else {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                           "brotli is enabled but \"gzip_vary\" is off; add "
-                           "\"gzip_vary on\" to emit \"Vary: Accept-Encoding\" "
-                           "so proxies and CDNs cache compressed and "
-                           "uncompressed responses separately");
-      }
-    }
-  }
+  /* No gzip_vary-off warning here anymore (parent #163): the header
+     filter emits "Vary: Accept-Encoding" itself on every
+     Accept-Encoding-dependent response (see
+     ngx_http_brotli_vary_accept_encoding()), so correctness no longer
+     depends on the operator setting "gzip_vary on", and warning about a
+     directive that no longer changes whether the header appears would be
+     actively misleading. */
 
   return NGX_CONF_OK;
 }
 
 /* Prepend to filter chain. */
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
-  ngx_http_brotli_main_conf_t* bmcf;
-
-  /* The per-location gzip_vary-off warnings withheld in merge_conf,
-     folded into one line. Still a warning rather than silence:
-     "compression_vary" defaults to off in that module, so its presence
-     does not prove the Vary header is actually emitted for these
-     locations — and one module cannot read another's merged
-     configuration to check (private conf struct; merge order between
-     unrelated modules is unspecified). Postconfiguration runs after
-     every merge, so the count is final. */
-  bmcf =
-      ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
-  if (bmcf != NULL && bmcf->vary_warn_suppressed) {
-    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                       "brotli is enabled with \"gzip_vary\" off in %ui "
-                       "location(s); the per-location warnings are "
-                       "suppressed because "
-                       "ngx_http_compression_vary_filter_module is loaded, "
-                       "but its \"compression_vary\" directive defaults to "
-                       "off; verify \"compression_vary on\" covers those "
-                       "locations so \"Vary: Accept-Encoding\" is emitted",
-                       bmcf->vary_warn_suppressed);
-  }
-
   ngx_http_next_header_filter = ngx_http_top_header_filter;
   ngx_http_top_header_filter = ngx_http_brotli_header_filter;
 

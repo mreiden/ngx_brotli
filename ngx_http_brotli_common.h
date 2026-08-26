@@ -414,48 +414,80 @@ ngx_http_brotli_ok(ngx_http_request_t *r)
 
 
 /*
- * ngx_http_brotli_vary_handled_externally()
+ * ngx_http_brotli_vary_accept_encoding()
  *
- * True when a module named "ngx_http_compression_vary_filter_module"
- * (HanadaLee's Vary-flattening filter) is loaded, statically or via
- * load_module. When its "compression_vary" directive is on, that
- * module emits Vary: Accept-Encoding keyed on r->gzip_vary alone,
- * regardless of clcf->gzip_vary — replacing the "gzip_vary" directive
- * (verified empirically against all four gzip_vary x compression_vary
- * quadrants; its author explicitly recommends "gzip_vary off" when
- * "compression_vary on" is used). With it loaded, "gzip_vary off" is
- * plausibly deliberate rather than a caching hazard.
+ * Emit "Vary: Accept-Encoding" BY CONSTRUCTION (parent nginx-zstd-module
+ * #163) rather than merely requesting it through r->gzip_vary. A brotli
+ * (or dcb, or Accept-Encoding-negotiated static) response is a
+ * content-coding variant, but nginx only turns r->gzip_vary into a Vary
+ * line when the core "gzip_vary" directive is on — and its default is
+ * OFF, under which nginx clears the flag and emits nothing, so by default
+ * a negotiated response shipped with no Vary and a shared cache could
+ * hand the compressed body to a client that cannot decode it.
  *
- * PRESENCE IS NOT PROOF, though: "compression_vary" itself defaults
- * to off, and this module cannot verify the effective value — the
- * conf struct is private to that module, and merge order between
- * unrelated modules follows their position in cycle->modules, so its
- * merged values may not even exist yet when ours merge. Callers
- * therefore must not silence the gzip_vary-off warning outright on
- * this check; they withhold the per-location lines and emit one
- * summary warning from postconfiguration that tells the operator
- * exactly what to verify.
+ * When gzip_vary is on, defer to nginx (it dedups against an existing
+ * line). When it is off, scan the response headers and push the literal
+ * line only if one is not already present (another filter, or the origin,
+ * may have set it), so the field is never doubled in either state.
  *
- * Called at merge-time: every load_module directive has been processed
- * by then (core conf parses before the http block), so
- * cf->cycle->modules is complete for both linkage styles.
- *
- * ngx_inline for the same reason as ngx_http_brotli_ok() above.
+ * Shared by the filter and static modules — a header-static so each
+ * translation unit gets its own copy, exactly like the helpers above.
  */
-static ngx_inline ngx_uint_t
-ngx_http_brotli_vary_handled_externally(ngx_conf_t *cf)
+static ngx_inline ngx_int_t
+ngx_http_brotli_vary_accept_encoding(ngx_http_request_t *r)
 {
-    ngx_uint_t  i;
+    ngx_uint_t                 i;
+    ngx_table_elt_t           *v, *h;
+    ngx_list_part_t           *part;
+    ngx_http_core_loc_conf_t  *clcf;
 
-    for (i = 0; cf->cycle->modules[i]; i++) {
-        if (ngx_strcmp(cf->cycle->modules[i]->name,
-                       "ngx_http_compression_vary_filter_module") == 0)
+    r->gzip_vary = 1;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf != NULL && clcf->gzip_vary) {
+        /* nginx's header filter emits the line from r->gzip_vary */
+        return NGX_OK;
+    }
+
+    for (part = &r->headers_out.headers.part, h = part->elts, i = 0;
+         /* void */;
+         i++)
+    {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Vary") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) == 0
+            && h[i].value.len == sizeof("Accept-Encoding") - 1
+            && ngx_strncasecmp(h[i].value.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) == 0)
         {
-            return 1;
+            return NGX_OK;
         }
     }
 
-    return 0;
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+    v->hash = 1;
+#if nginx_version >= 1023000
+    v->next = NULL;
+#endif
+    ngx_str_set(&v->key, "Vary");
+    ngx_str_set(&v->value, "Accept-Encoding");
+    return NGX_OK;
 }
 
 
