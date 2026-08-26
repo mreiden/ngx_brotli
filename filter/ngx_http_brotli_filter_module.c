@@ -409,20 +409,24 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
      its cache-key dimension through the brotli_bypass_vary push above.
 
      With dictionaries configured, the response ALSO varies on
-     Available-Dictionary (the dcb variant, the plain-br variant a
-     dictionary-less client gets, and the identity fallback are all keyed
-     on it). Emit ONE combined "Vary: Accept-Encoding, Available-Dictionary"
-     rather than a delegated Accept-Encoding line plus a separate literal
-     Available-Dictionary line: two Vary lines are legal per RFC 9110, but
-     a fair number of intermediary caches key on the FIRST line only —
+     Available-Dictionary and on Sec-Fetch-Site. Available-Dictionary
+     because the dcb variant, the plain-br variant a dictionary-less
+     client gets, and the identity fallback are all keyed on it.
+     Sec-Fetch-Site (parent #160) because dcb_negotiate() below refuses
+     the dictionary coding for any value other than absent / same-origin
+     / none (RFC 9842 §8.3 cross-origin partitioning), which makes that
+     header a response-selection input: without it in Vary a shared cache
+     filled by a same-origin request would serve the dcb body to a
+     cross-site request whose gate said no (or the reverse) — a hit on the
+     wrong variant across the partition.
+
+     Emit ONE combined "Vary: Accept-Encoding, Available-Dictionary,
+     Sec-Fetch-Site" rather than a delegated Accept-Encoding line plus
+     separate literal lines: two Vary lines are legal per RFC 9110, but a
+     fair number of intermediary caches key on the FIRST line only —
      exactly the hazard this header exists to prevent. The combined-line
      branch does NOT set r->gzip_vary, so the core emitter cannot add a
-     second Accept-Encoding line beside it.
-
-     (Sec-Fetch-Site is a dcb response-selection input too — dcb_negotiate
-     refuses any value other than same-origin/none — and belongs in this
-     line as well; adding it is the separate #160 sync, deliberately left
-     out of this Vary-by-construction change.) */
+     second Accept-Encoding line beside it. */
   if (conf->dcb_dicts != NULL && conf->dcb_dicts->nelts > 0) {
     ngx_table_elt_t* v;
 
@@ -436,7 +440,8 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     v->next = NULL;
 #endif
     ngx_str_set(&v->key, "Vary");
-    ngx_str_set(&v->value, "Accept-Encoding, Available-Dictionary");
+    ngx_str_set(&v->value,
+                "Accept-Encoding, Available-Dictionary, Sec-Fetch-Site");
 
   } else if (ngx_http_brotli_vary_accept_encoding(r) != NGX_OK) {
     return NGX_ERROR;

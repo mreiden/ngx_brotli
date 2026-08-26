@@ -87,7 +87,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcb
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -108,7 +108,7 @@ GET /t
 Accept-Encoding: br, dcb
 --- response_headers
 Content-Encoding: br
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -195,6 +195,10 @@ Content-Encoding: br
 
 
 === TEST 7: Sec-Fetch-Site cross-site is refused
+# The refused (cross-site) response falls back to br but MUST still carry
+# Sec-Fetch-Site in Vary (parent #160): otherwise a shared cache could
+# serve this br body to a same-origin request that would have gotten dcb,
+# or the reverse — a hit on the wrong variant across the §8.3 partition.
 --- config
     location /t {
         brotli on;
@@ -209,6 +213,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:\nSec-Fetch-Site: cross-site"
 --- response_headers
 Content-Encoding: br
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -296,7 +301,7 @@ GET /t
 "Accept-Encoding: dcb\nAvailable-Dictionary: :$::bad_b64:"
 --- response_headers
 !Content-Encoding
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -387,7 +392,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcb
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -497,7 +502,7 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: br
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -545,6 +550,6 @@ GET /t
 "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcb
-Vary: Accept-Encoding, Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
