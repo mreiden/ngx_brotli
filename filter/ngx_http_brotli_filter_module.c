@@ -182,6 +182,8 @@ static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
 
 static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
                                            void* conf);
+static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
+                                              size_t size);
 static ngx_table_elt_t* ngx_http_brotli_find_request_header(
     ngx_http_request_t* r, const char* name, size_t len);
 static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
@@ -1232,6 +1234,47 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
   return NGX_OK;
 }
 
+/* Read exactly `size` bytes of a dictionary into `buf`, looping until the
+   request is satisfied. Mirrors the sibling nginx-zstd-module's #195:
+   ngx_read_fd() is read(2) on POSIX, which may return a SHORT count on a
+   regular file — a signal interrupting the read after a partial transfer,
+   or a sufficiently large read — so a single read is not enough and the
+   caller would reject a valid dictionary as an incomplete read. Retry
+   EINTR, resume on a short count, and stop early only on a hard error
+   (returns -1) or an unexpected EOF (returns the partial total < size).
+   The caller's existing n < 0 / n != size handling is unchanged.
+
+   The EINTR retry is #if !(NGX_WIN32): win32's ngx_errno.h defines no
+   NGX_EINTR (ReadFile on a synchronous handle is not interruptible), so
+   guarding on the platform states the reason and keeps the MSVC build
+   compiling. */
+static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
+                                              size_t size) {
+  ssize_t n;
+  size_t done;
+
+  for (done = 0; done < size; /* void */) {
+    n = ngx_read_fd(fd, buf + done, size - done);
+
+    if (n < 0) {
+#if !(NGX_WIN32)
+      if (ngx_errno == NGX_EINTR) {
+        continue;
+      }
+#endif
+      return -1;
+    }
+
+    if (n == 0) {
+      break;  /* EOF before `size`: return the partial */
+    }
+
+    done += (size_t)n;
+  }
+
+  return (ssize_t)done;
+}
+
 /* brotli_dcb_dict_file <path> — load one RFC 9842 dictionary. The file
    is read and hashed here at config parse (nginx -t validates it), into
    cf->pool so the raw bytes live exactly as long as the configuration
@@ -1374,7 +1417,7 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     goto failed;
   }
 
-  n = ngx_read_fd(fd, (void*)dict->bytes.data, size);
+  n = ngx_http_brotli_read_dict_file(fd, dict->bytes.data, size);
   if (n < 0) {
     ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
                        ngx_read_fd_n " \"%V\" failed", &path);

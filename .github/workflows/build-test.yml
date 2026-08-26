@@ -196,6 +196,9 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" --port 18190
           echo "✓ dcb wire-format test passed"
 
+      - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
+        run: bash tools/test_read_dict_file_unit.sh
+
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:
     name: Build & smoke (bundled brotli v1.2.0)
