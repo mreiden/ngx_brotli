@@ -47,19 +47,19 @@ against current nginx. Differences from upstream:
   `brotli_bypass` / `brotli_bypass_vary` per-request bypass predicates
   (the operator lever for BREACH-style exposures, with the cache key the
   bypass decision varies on declared explicitly);
-  `BROTLI_PARAM_SIZE_HINT` set from the declared content length; a
-  config-load warning when `brotli`/`brotli_static` is enabled in a
-  location whose effective `gzip_vary` is off (matching the zstd
-  siblings — without `Vary: Accept-Encoding` a shared cache can serve
-  the compressed variant to a client that cannot decode it;
-  `brotli_static always` is exempt since it does not vary; when
+  `BROTLI_PARAM_SIZE_HINT` set from the declared content length;
+  `Vary: Accept-Encoding` emitted by construction on every negotiated
+  response (matching the zstd siblings' #163 — without it a shared
+  cache can serve the compressed variant to a client that cannot decode
+  it; correctness no longer depends on the operator's `gzip_vary`
+  directive, whose default is off, and the old gzip_vary-off
+  config-load warnings are gone with the dependency; with `gzip_vary
+  on` the module defers to nginx's own emitter, and `r->gzip_vary` is
+  still set, so
   [ngx_http_compression_vary_filter_module](https://github.com/HanadaLee/ngx_http_compression_vary_filter_module)
-  is loaded — it emits the header from `r->gzip_vary` in place of the
-  `gzip_vary` directive wherever `compression_vary on` applies — the
-  per-location warnings collapse into one summary warning per module
-  asking you to verify `compression_vary on` covers those locations,
-  since that directive itself defaults to off and its effective value
-  cannot be read from another module).
+  — which keys on that flag and flattens Vary — folds rather than
+  doubles the line; exactly one `Vary: Accept-Encoding` in every state;
+  `brotli_static always` still sends no Vary since it does not vary).
 - **Tests:** a Test::Nginx regression suite (`t/`) covering the
   negotiation matrix, bypass, caps, and the static-module fallback
   regression, run in CI alongside the roundtrip smoke tool and the fuzz

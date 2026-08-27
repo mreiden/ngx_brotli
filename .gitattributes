@@ -19,4 +19,3 @@ fuzz/fuzz.dict -text
 
 # CI-only stub module for the vary-suppression witness; it claims a
 # real third-party module's name and must never ship in archives.
-/tools/ci-cvary-stub export-ignore
