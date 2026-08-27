@@ -516,3 +516,73 @@ Accept-Ranges: bytes
 --- response_body
 --- no_error_log
 [error]
+
+=== TEST 20: an origin Vary listing Accept-Encoding among tokens is not doubled
+# zstd sibling #200 row n11: the by-construction push's dedup scan must
+# tokenize the existing Vary value on commas — an exact-value compare
+# misses "Accept-Encoding, Cookie" and doubles the token on a second
+# line. gzip_vary stays off so the module's own push path runs.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 1;
+        brotli_types text/plain;
+        default_type text/plain;
+        add_header Vary "Accept-Encoding, Cookie";
+        return 200 "brotli vary dedup fixture body long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding, Cookie
+--- raw_response_headers_unlike eval
+qr/Vary: Accept-Encoding\r/
+--- no_error_log
+[error]
+
+
+=== TEST 21: a skipped foreign parameter negotiates at q=1 (lenient, deliberate)
+# zstd sibling #201/m5 parity: an unrecognized parameter is skipped,
+# not fatal to the element — the deliberate divergence from core
+# gzip's parser, which drops the whole element.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 1;
+        brotli_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "brotli vary dedup fixture body long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br;foo=bar
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 22: a skipped foreign parameter still honours its element's q=0
+# The half that justifies the leniency: skipping "foo=bar" preserves
+# the trailing q the client actually sent; core never sees it.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 1;
+        brotli_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "brotli vary dedup fixture body long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br;foo=bar;q=0
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
