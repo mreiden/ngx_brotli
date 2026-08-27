@@ -184,12 +184,38 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
                                            void* conf);
 static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
                                               size_t size);
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf);
+static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf);
 static ngx_table_elt_t* ngx_http_brotli_find_request_header(
     ngx_http_request_t* r, const char* name, size_t len);
 static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     ngx_http_request_t* r, ngx_http_brotli_conf_t* conf);
 static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
                                                  ngx_http_brotli_ctx_t* ctx);
+
+/* Cycle-global dictionary trust policy (zstd siblings' #165 + #199).
+   MAIN_CONF only: the loaded dictionaries are cycle state, so the
+   policy is a property of the whole load, declared once in http{}. */
+typedef struct {
+  /* brotli_dcb_dict_strict_path: opt-in, off by default. When on, the
+     dictionary path is resolved one component at a time with
+     openat(O_NOFOLLOW|O_DIRECTORY) -- an intermediate symlink (the
+     classic current -> releases/7 layout) is refused, not followed --
+     and the file must be owned by the loading principal or root and
+     not be writable by group or other. */
+  ngx_flag_t dict_strict_path;
+
+  /* Set by ngx_http_brotli_dcb_dict_file() the first time it loads a
+     dictionary while dict_strict_path does not yet read as the
+     explicit "on" at that point in the parse. Directives are
+     conventionally order-independent, so silently treating such a
+     load as "strict passed" would fail OPEN; init_main_conf rejects
+     the ordering outright when the final value is "on", rather than
+     re-opening every dictionary post-parse (which would reintroduce
+     the TOCTOU window the fstat-after-open checks close). */
+  ngx_flag_t dict_loaded_before_strict_on;
+  ngx_str_t dict_loaded_before_strict_on_file;
+} ngx_http_brotli_main_conf_t;
 
 /* Configuration literals. */
 
@@ -268,6 +294,11 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
      ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, dcb_assume_secure), NULL},
 
+    {ngx_string("brotli_dcb_dict_strict_path"),
+     NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG, ngx_conf_set_flag_slot,
+     NGX_HTTP_MAIN_CONF_OFFSET,
+     offsetof(ngx_http_brotli_main_conf_t, dict_strict_path), NULL},
+
     ngx_null_command};
 
 /* Module context hooks. */
@@ -275,8 +306,8 @@ static ngx_http_module_t ngx_http_brotli_filter_module_ctx = {
     ngx_http_brotli_add_variables, /* pre-configuration */
     ngx_http_brotli_filter_init,   /* post-configuration */
 
-    NULL, /* create main configuration */
-    NULL, /* init main configuration */
+    ngx_http_brotli_create_main_conf, /* create main configuration */
+    ngx_http_brotli_init_main_conf,   /* init main configuration */
 
     NULL, /* create server configuration */
     NULL, /* merge server configuration */
@@ -1275,6 +1306,220 @@ static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
   return (ssize_t)done;
 }
 
+#if !(NGX_WIN32)
+#include <fcntl.h> /* openat(), O_DIRECTORY, O_NOFOLLOW, AT_FDCWD */
+/* AT_FDCWD is the portable signal that the POSIX.1-2008 *at() family is
+   available (zstd sibling #199). Where it is absent strict mode has no
+   way to resolve a path component-by-component, and it fails CLOSED at
+   config load rather than degrading to a leaf-only guarantee. */
+#ifdef AT_FDCWD
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 1
+#else
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 0
+#endif
+#else
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 0
+#endif
+
+#if (NGX_HTTP_BROTLI_HAVE_STRICT_WALK) && (NGX_HTTP_BROTLI_HAVE_DCB)
+
+/* Strict-mode component-by-component open (zstd sibling #199, M3).
+
+   O_NOFOLLOW on a whole-path open guards ONLY the leaf: the kernel
+   resolves every intermediate component normally, so a symlinked
+   directory in the path -- the classic current -> releases/7 deploy
+   layout -- is followed silently and strict mode selects whatever
+   bytes the symlink's owner points it at. Walking the path with
+   openat(O_NOFOLLOW|O_DIRECTORY) one component at a time makes an
+   intermediate symlink fail the walk (ELOOP) instead of being
+   traversed, and the leaf is opened relative to the verified parent
+   fd -- symlink-free end to end and TOCTOU-safe against a component
+   swap racing the walk.
+
+   Absolute paths only: the directive handler has already run the path
+   through ngx_conf_full_name(). Returns the leaf fd, or
+   NGX_INVALID_FILE having logged the reason. */
+static ngx_fd_t ngx_http_brotli_open_dict_strict(ngx_conf_t* cf,
+                                                 ngx_str_t* path, int flags) {
+  u_char* p;
+  u_char* start;
+  u_char* end;
+  int fd, next, oflags;
+
+  if (path->len == 0 || path->data[0] != '/') {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"%V\" is not an absolute path; refused by "
+                       "\"brotli_dcb_dict_strict_path on\", which resolves "
+                       "the path one component at a time and cannot verify "
+                       "a relative prefix",
+                       path);
+    return NGX_INVALID_FILE;
+  }
+
+  fd = open("/", O_RDONLY | O_DIRECTORY
+#ifdef O_CLOEXEC
+                     | O_CLOEXEC
+#endif
+  );
+  if (fd < 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       "open(\"/\") failed while resolving \"%V\" under "
+                       "\"brotli_dcb_dict_strict_path on\"",
+                       path);
+    return NGX_INVALID_FILE;
+  }
+
+  start = path->data + 1;
+  end = path->data + path->len;
+
+  for (;;) {
+    /* Skip any run of separators; a trailing one means no leaf. */
+    while (start < end && *start == '/') {
+      start++;
+    }
+
+    if (start >= end) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "\"%V\" names a directory, not a dictionary file; "
+                         "refused by \"brotli_dcb_dict_strict_path on\"",
+                         path);
+      ngx_close_file(fd);
+      return NGX_INVALID_FILE;
+    }
+
+    for (p = start; p < end && *p != '/'; p++) { /* void */
+    }
+
+    /* openat() needs a NUL-terminated component. The component is
+       COPIED into a local buffer rather than NUL-terminated in place:
+       path->data is nginx's own config string, and writing into it --
+       even a byte restored immediately afterwards -- would mutate
+       shared config memory other directives and the error log still
+       read. A component longer than the buffer cannot name a file any
+       filesystem will accept, so it is refused rather than silently
+       truncated (truncation would open a DIFFERENT name). */
+    {
+      u_char comp[NGX_MAX_PATH];
+      size_t complen = (size_t)(p - start);
+      int last;
+      u_char* q;
+
+      if (complen >= sizeof(comp)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" has a path component longer than %uz "
+                           "bytes; refused by "
+                           "\"brotli_dcb_dict_strict_path on\"",
+                           path, sizeof(comp) - 1);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      ngx_memcpy(comp, start, complen);
+      comp[complen] = '\0';
+
+      last = 1;
+      for (q = p; q < end; q++) {
+        if (*q != '/') {
+          last = 0;
+          break;
+        }
+      }
+
+      /* "." and ".." are refused rather than resolved: ".." would
+         climb back above a component already verified, which makes
+         the walk's guarantee unstatable, and neither has a legitimate
+         place in a deployed dictionary path. */
+      if (ngx_strcmp(comp, ".") == 0 || ngx_strcmp(comp, "..") == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" contains a \".\" or \"..\" component; "
+                           "refused by \"brotli_dcb_dict_strict_path on\"",
+                           path);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      /* O_CLOEXEC is applied to BOTH arms deliberately: folding it
+         into the ternary via a bare "#ifdef ... | O_CLOEXEC" would
+         bind it to the else-branch alone by C's precedence rules,
+         silently leaving the leaf fd inheritable across an exec. */
+      oflags = last ? (flags | O_NOFOLLOW)
+                    : (O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+#ifdef O_CLOEXEC
+      oflags |= O_CLOEXEC;
+#endif
+
+      next = openat(fd, (char*)comp, oflags);
+
+      if (next < 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "openat(\"%s\") failed while resolving \"%V\" "
+                           "under \"brotli_dcb_dict_strict_path on\" (a "
+                           "symlink at any component is refused, not "
+                           "followed; a release-symlink deployment needs "
+                           "\"brotli_dcb_dict_strict_path off;\", the "
+                           "default)",
+                           comp, path);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      ngx_close_file(fd);
+      fd = next;
+
+      if (last) {
+        return fd;
+      }
+
+      start = p;
+    }
+  }
+}
+
+#endif /* NGX_HTTP_BROTLI_HAVE_STRICT_WALK && NGX_HTTP_BROTLI_HAVE_DCB */
+
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  bmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_main_conf_t));
+  if (bmcf == NULL) {
+    return NULL;
+  }
+
+  /* pcalloc zeroes the ordering record; cycle-owned, no reset hook. */
+  bmcf->dict_strict_path = NGX_CONF_UNSET;
+
+  return bmcf;
+}
+
+static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf) {
+  ngx_http_brotli_main_conf_t* bmcf = conf;
+
+  ngx_conf_init_value(bmcf->dict_strict_path, 0); /* off by default */
+
+  /* Reject the ordering rather than silently accept an unchecked load
+     (zstd siblings' shape): the loader records the first dictionary
+     that loaded while dict_strict_path did not yet read as the
+     explicit "on". If the flag's FINAL value is "on", that load ran
+     without the walk, the ownership check, or the writable-target
+     check -- fail the config rather than start with a dictionary the
+     operator asked to have vetted but that never was. */
+  if (bmcf->dict_strict_path == 1 && bmcf->dict_loaded_before_strict_on) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_strict_path on\" was declared "
+                       "AFTER \"brotli_dcb_dict_file %V\", which had "
+                       "already loaded unchecked by that point. nginx "
+                       "directives are order-independent by convention, "
+                       "but this one is not: move "
+                       "\"brotli_dcb_dict_strict_path on;\" before every "
+                       "\"brotli_dcb_dict_file\" directive it must apply "
+                       "to",
+                       &bmcf->dict_loaded_before_strict_on_file);
+    return NGX_CONF_ERROR;
+  }
+
+  return NGX_CONF_OK;
+}
+
 /* brotli_dcb_dict_file <path> — load one RFC 9842 dictionary. The file
    is read and hashed here at config parse (nginx -t validates it), into
    cf->pool so the raw bytes live exactly as long as the configuration
@@ -1303,6 +1548,7 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   u_char hash[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
   ngx_http_brotli_dcb_dict_t* dict;
   ngx_http_brotli_dcb_dict_t* dicts;
+  ngx_http_brotli_main_conf_t* bmcf;
 
   (void)cmd;
 
@@ -1376,11 +1622,60 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     }
   }
 
-  fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-  if (fd == NGX_INVALID_FILE) {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                       ngx_open_file_n " \"%V\" failed", &path);
+  bmcf =
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+
+  /* This load is about to run under whatever dict_strict_path reads
+     RIGHT NOW; if that is anything but the explicit "on", the strict
+     checks below are skipped -- record it so init_main_conf can
+     reject the config if a later "brotli_dcb_dict_strict_path on;"
+     was meant to cover this load. */
+  if (bmcf->dict_strict_path != 1 && !bmcf->dict_loaded_before_strict_on) {
+    bmcf->dict_loaded_before_strict_on = 1;
+    bmcf->dict_loaded_before_strict_on_file = path;
+  }
+
+  /* O_NONBLOCK always (zstd sibling #165): a FIFO at the dictionary
+     path would otherwise block the config-parsing master in open()
+     until a writer appeared -- nginx -t or a reload would just hang.
+     Win32's NGX_FILE_NONBLOCK is 0, a no-op. Under strict mode the
+     path is resolved one component at a time instead (sibling #199);
+     a strict refusal is a trust decision, so it is always fatal. */
+  if (bmcf->dict_strict_path == 1) {
+
+#if (NGX_HTTP_BROTLI_HAVE_STRICT_WALK)
+    fd = ngx_http_brotli_open_dict_strict(cf, &path,
+                                          O_RDONLY | NGX_FILE_NONBLOCK);
+    if (fd == NGX_INVALID_FILE) {
+      /* the walk has already logged the precise component */
+      return NGX_CONF_ERROR;
+    }
+#else
+    /* Fail CLOSED (sibling #199): without openat() strict mode can
+       only offer a leaf-only O_NOFOLLOW guarantee, which an
+       intermediate symlink defeats -- accepting the config here would
+       let the directive claim a protection the platform cannot
+       deliver. */
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_strict_path on\" is not "
+                       "supported on this platform (no openat(); the "
+                       "path cannot be resolved one component at a "
+                       "time, so an intermediate symlink could not be "
+                       "refused). Refusing \"%V\" rather than loading "
+                       "it with a weaker guarantee than the directive "
+                       "states",
+                       &path);
     return NGX_CONF_ERROR;
+#endif
+
+  } else {
+    fd = ngx_open_file(path.data, NGX_FILE_RDONLY | NGX_FILE_NONBLOCK,
+                       NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                         ngx_open_file_n " \"%V\" failed", &path);
+      return NGX_CONF_ERROR;
+    }
   }
 
   if (ngx_fd_info(fd, &info) == NGX_FILE_ERROR) {
@@ -1388,6 +1683,63 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
                        ngx_fd_info_n " \"%V\" failed", &path);
     goto failed;
   }
+
+  /* A non-regular target is rejected UNCONDITIONALLY (zstd sibling
+     #165): a FIFO/socket/directory/device was never a valid
+     dictionary, and the old behaviour against one always eventually
+     errored or hung. ngx_is_file() checks S_ISREG. */
+  if (!ngx_is_file(&info)) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is not a regular file", &path);
+    goto failed;
+  }
+
+#if !(NGX_WIN32)
+  /* Ownership, not just the mode bits (zstd sibling #199, M4): a
+     dictionary owned by an unprivileged account at an ordinary 0644
+     passes a group/other-writability test while a root master reads
+     it -- and that owner can rewrite the file ahead of any privileged
+     reload. Strict mode requires the loading principal's euid or
+     root. */
+  if (bmcf->dict_strict_path == 1 && info.st_uid != geteuid() &&
+      info.st_uid != 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is owned by uid %uD, neither "
+                       "the loading principal (uid %uD) nor root; refused "
+                       "by \"brotli_dcb_dict_strict_path on\", because "
+                       "that owner can rewrite the file and steer what a "
+                       "later privileged reload loads",
+                       &path, (uint32_t)info.st_uid, (uint32_t)geteuid());
+    goto failed;
+  }
+
+  /* Strict trust (zstd sibling #165): reject a dictionary writable by
+     group or other -- a lower-privileged local writer must not be
+     able to swap bytes into every worker on the next reload. Opt-in,
+     since a release-managed deployment may legitimately ship such
+     permissions. */
+  if (bmcf->dict_strict_path == 1 &&
+      (ngx_file_access(&info) & (S_IWGRP | S_IWOTH))) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is writable by group or "
+                       "other and \"brotli_dcb_dict_strict_path\" is on",
+                       &path);
+    goto failed;
+  }
+
+  /* The FIFO-hang risk was only in open(); the file is now confirmed
+     regular, so clear O_NONBLOCK before the read loop below -- a
+     non-blocking regular-file read can return SHORT on some
+     filesystems (observed on a 9p/drvfs mount), which the loader
+     would then reject as an incomplete read. */
+  {
+    int fl = fcntl(fd, F_GETFL);
+
+    if (fl != -1) {
+      (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+  }
+#endif
 
   size = ngx_file_size(&info);
 

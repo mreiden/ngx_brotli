@@ -61,6 +61,22 @@ our $dict_hex = unpack("H*", sha256($dict_raw));
 our $odd_hex  = "01" x 32;
 our $odd_b64  = encode_base64("\x01" x 32, "");
 
+# strict-walk fixtures (zstd siblings #165/#199): an out-of-repo tempdir
+# whose ABSOLUTE path goes into the config verbatim — a real directory,
+# a dictionary inside it, and a symlinked alias to the directory. A
+# tempdir rather than t/suite deliberately: the walk's ownership and
+# mode checks see real ext4 permissions there, not a mount's blanket
+# 0777 metadata.
+use File::Temp qw(tempdir);
+our $walkdir = tempdir(CLEANUP => 1);
+mkdir "$walkdir/real" or die "mkdir: $!";
+{
+    open my $h, '>', "$walkdir/real/w.dict" or die "spew: $!";
+    print $h "strict walk fixture dictionary contents\n" x 20;
+    close $h;
+}
+symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
+
 no_long_string();
 log_level 'warn';
 repeat_each(1);
@@ -553,3 +569,86 @@ Content-Encoding: dcb
 Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
+
+=== TEST 23: strict_path declared AFTER a dict_file is a config error
+# Order-dependent fail-open (zstd siblings' shape): the flag is read at
+# parse time, so a load above the "on" line ran without the walk, the
+# ownership check, or the writable-target check. Rejecting the ordering
+# beats re-opening every dictionary post-parse (the TOCTOU window the
+# fstat-after-open checks close).
+--- http_config eval
+"brotli_dcb_dict_file $::walkdir/real/w.dict;
+ brotli_dcb_dict_strict_path on;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+"brotli_dcb_dict_strict_path on" was declared AFTER
+--- no_error_log
+[alert]
+
+
+=== TEST 24: strict_path declared BEFORE the dict_file loads and serves
+# Positive control for TESTs 23/25/26: identical file, symlink-free
+# absolute chain, sanctioned order — the walk verifies every component,
+# the ownership and mode checks pass, and the server starts.
+--- http_config eval
+"brotli_dcb_dict_strict_path on;
+ brotli_dcb_dict_file $::walkdir/real/w.dict;"
+--- config
+    location /t { return 200 "ok\n"; }
+--- request
+GET /t
+--- error_code: 200
+--- response_body
+ok
+--- no_error_log
+[error]
+
+
+=== TEST 25: strict mode refuses a ".." path component
+# zstd sibling #199 (M3): ".." would climb back above a component the
+# walk already verified — refused rather than resolved.
+--- http_config eval
+"brotli_dcb_dict_strict_path on;
+ brotli_dcb_dict_file $::walkdir/real/../real/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+contains a "." or ".." component
+--- no_error_log
+[alert]
+
+
+=== TEST 26: strict mode refuses a symlinked INTERMEDIATE component
+# zstd sibling #199 (M3): O_NOFOLLOW on a whole-path open guards only
+# the leaf, so the classic "current -> releases/7" layout walked
+# straight through the old check (which here was NO check at all). The
+# component walk refuses the symlink where it sits; the same file
+# loads through its real chain in TEST 24.
+--- http_config eval
+"brotli_dcb_dict_strict_path on;
+ brotli_dcb_dict_file $::walkdir/link/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+a symlink at any component is refused
+--- no_error_log
+[alert]
+
+
+=== TEST 27: a non-regular dictionary path is FATAL, unconditionally
+# zstd sibling #165: a directory (or FIFO/socket/device) was never a
+# valid dictionary. Not gated on strict_path — ngx_is_file() rejects it
+# before any read, where the old code fell into a read error at best.
+--- http_config eval
+"brotli_dcb_dict_file $::walkdir/real;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+is not a regular file
+--- no_error_log
+[alert]

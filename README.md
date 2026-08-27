@@ -108,9 +108,19 @@ against current nginx. Differences from upstream:
   dictionaries turns seconds of `nginx -t`/reload time into a blip
   (`NGX_BROTLI_NO_LIBCRYPTO=1` in the configure environment opts out) —
   with a portable implementation built in as the fallback. Empty,
-  oversized (>10 MB) and duplicate-hash dictionaries are config-load
-  errors (supplied hashes are compared as declared; with computed
-  hashes "duplicate" means identical content). Verify end-to-end: strip the first 36 bytes of a response and
+  oversized (>10 MB), non-regular-file and duplicate-hash dictionaries
+  are config-load errors (supplied hashes are compared as declared;
+  with computed hashes "duplicate" means identical content).
+  `brotli_dcb_dict_strict_path on;` (`http` only, default off) opts
+  into a stricter trust policy for every dictionary load: the path is
+  resolved one component at a time with `openat(O_NOFOLLOW)` so a
+  symlink **anywhere** in it — including a `current -> releases/N`
+  deploy layout, which is why the default stays off — is refused
+  rather than followed, `.`/`..` components are rejected, and the file
+  must be owned by the loading principal (or root) and not writable by
+  group or other. The directive must precede every
+  `brotli_dcb_dict_file` it applies to; declaring it after one is a
+  config-load error rather than a silently unvetted load. Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.
   **Troubleshooting:** if `Vary: Available-Dictionary` appears but dcb
   never negotiates for hashes you know are right, run
