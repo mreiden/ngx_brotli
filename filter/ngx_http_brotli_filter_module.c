@@ -171,6 +171,8 @@ static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf);
 static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
                                                 uintptr_t data);
+static ngx_int_t ngx_http_brotli_dcb_dicts_hashed_variable(
+    ngx_http_request_t* r, ngx_http_variable_value_t* v, uintptr_t data);
 
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf);
 static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
@@ -215,6 +217,34 @@ typedef struct {
      the TOCTOU window the fstat-after-open checks close). */
   ngx_flag_t dict_loaded_before_strict_on;
   ngx_str_t dict_loaded_before_strict_on_file;
+
+  /* brotli_dcb_dict_trust_hashes (zstd sibling #198 + #220): default
+     off VERIFIES a supplied hash literal against the bytes read -- a
+     mismatch fails the load, protecting a pipeline whose config
+     generation and file placement are decoupled. "on" restores the
+     trusted-verbatim path: the literal IS the negotiation key and the
+     load-time SHA-256 is skipped, which at hundreds of dictionaries is
+     essentially all of the config-load CPU (the sibling measured 737
+     lines: nginx -t 5.1s -> 0.9s, user CPU 4.3s -> 0.03s). Lines
+     without a literal are hashed under either policy -- which is also
+     the per-line escape hatch under trust. */
+  ngx_flag_t dcb_dict_trust_hashes;
+
+  /* Ordering record, same trap and remedy as the strict_path pair
+     above: a literal VERIFIED (hashed) because trust did not yet read
+     "on" at that point in the parse is correct but silently paid the
+     full pass the directive exists to skip; init_main_conf rejects
+     the ordering when the final value is "on". */
+  ngx_flag_t dcb_dict_verified_before_trust_on;
+  ngx_str_t dcb_dict_verified_before_trust_on_file;
+
+  /* Load-time SHA-256 computations over dcb dictionaries in THIS
+     configuration ($brotli_dcb_dicts_hashed). Cycle-owned; the
+     observable witness that trust_hashes actually skips the pass
+     (zero for trusted literals) rather than substituting the literal
+     after hashing anyway -- the evidence gap the old trusted-verbatim
+     test admitted it could not close. */
+  ngx_uint_t dcb_dicts_hashed;
 } ngx_http_brotli_main_conf_t;
 
 /* Configuration literals. */
@@ -298,6 +328,15 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
      NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG, ngx_conf_set_flag_slot,
      NGX_HTTP_MAIN_CONF_OFFSET,
      offsetof(ngx_http_brotli_main_conf_t, dict_strict_path), NULL},
+
+    /* MAIN_CONF like strict_path, same reason: what a supplied hash
+       literal MEANS is a property of the whole load's trust model.
+       Must precede every brotli_dcb_dict_file carrying a literal
+       (enforced in init_main_conf). */
+    {ngx_string("brotli_dcb_dict_trust_hashes"),
+     NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG, ngx_conf_set_flag_slot,
+     NGX_HTTP_MAIN_CONF_OFFSET,
+     offsetof(ngx_http_brotli_main_conf_t, dcb_dict_trust_hashes), NULL},
 
     ngx_null_command};
 
@@ -1126,6 +1165,8 @@ static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
 }
 
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {
+  static ngx_str_t dicts_hashed_name =
+      ngx_string("brotli_dcb_dicts_hashed");
   ngx_http_variable_t* var;
 
   var = ngx_http_add_variable(cf, &ngx_http_brotli_ratio, 0);
@@ -1134,6 +1175,40 @@ static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {
   }
 
   var->get_handler = ngx_http_brotli_ratio_variable;
+
+  var = ngx_http_add_variable(cf, &dicts_hashed_name, 0);
+  if (var == NULL) {
+    return NGX_ERROR;
+  }
+
+  var->get_handler = ngx_http_brotli_dcb_dicts_hashed_variable;
+
+  return NGX_OK;
+}
+
+/* $brotli_dcb_dicts_hashed — load-time SHA-256 passes over dcb
+   dictionaries this configuration cycle. Constant after config parse.
+   Operators check that trust_hashes actually took effect (zero with
+   every line trusted); the suite uses it as the witness that trust
+   SKIPS the pass rather than substituting the literal after hashing
+   anyway. */
+static ngx_int_t ngx_http_brotli_dcb_dicts_hashed_variable(
+    ngx_http_request_t* r, ngx_http_variable_value_t* v, uintptr_t data) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  (void)data;
+
+  bmcf = ngx_http_get_module_main_conf(r, ngx_http_brotli_filter_module);
+
+  v->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
+  if (v->data == NULL) {
+    return NGX_ERROR;
+  }
+
+  v->len = ngx_sprintf(v->data, "%ui", bmcf->dcb_dicts_hashed) - v->data;
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
 
   return NGX_OK;
 }
@@ -1485,8 +1560,10 @@ static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
     return NULL;
   }
 
-  /* pcalloc zeroes the ordering record; cycle-owned, no reset hook. */
+  /* pcalloc zeroes the ordering records and the hashed counter;
+     cycle-owned, no reset hook. */
   bmcf->dict_strict_path = NGX_CONF_UNSET;
+  bmcf->dcb_dict_trust_hashes = NGX_CONF_UNSET;
 
   return bmcf;
 }
@@ -1514,6 +1591,28 @@ static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf) {
                        "\"brotli_dcb_dict_file\" directive it must apply "
                        "to",
                        &bmcf->dict_loaded_before_strict_on_file);
+    return NGX_CONF_ERROR;
+  }
+
+  ngx_conf_init_value(bmcf->dcb_dict_trust_hashes, 0); /* verify default */
+
+  /* Same ordering rejection with the opposite polarity: a literal
+     that loaded before a later "trust on" was VERIFIED -- correct
+     bytes, but the hashing pass the directive exists to skip was
+     silently paid, which at hundreds of dictionaries is the entire
+     cost. Reject rather than be quietly position-dependent. */
+  if (bmcf->dcb_dict_trust_hashes == 1 &&
+      bmcf->dcb_dict_verified_before_trust_on) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_trust_hashes on\" was declared "
+                       "AFTER \"brotli_dcb_dict_file %V\", whose hash "
+                       "literal had already been verified (hashed) by "
+                       "that point. nginx directives are "
+                       "order-independent by convention, but this one is "
+                       "not: move \"brotli_dcb_dict_trust_hashes on;\" "
+                       "before every \"brotli_dcb_dict_file\" directive "
+                       "it must apply to",
+                       &bmcf->dcb_dict_verified_before_trust_on_file);
     return NGX_CONF_ERROR;
   }
 
@@ -1549,6 +1648,7 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   ngx_http_brotli_dcb_dict_t* dict;
   ngx_http_brotli_dcb_dict_t* dicts;
   ngx_http_brotli_main_conf_t* bmcf;
+  ngx_flag_t trust;
 
   (void)cmd;
 
@@ -1559,23 +1659,26 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     return NGX_CONF_ERROR;
   }
 
-  /* Optional second argument: the dictionary's SHA-256 as 64 hex chars,
-     trusted VERBATIM in place of hashing the file here — the win is
-     skipping a full read-and-hash pass per dictionary at every config
-     parse (nginx -t, every reload), which dominates parse time at
-     hundreds of registered dictionaries. The deploy tooling that
+  /* Optional second argument: the dictionary's SHA-256 as 64 hex
+     chars. By default it is VERIFIED against the bytes read below
+     (zstd sibling #198): a declaration of what the operator believes
+     the file to be, whose mismatch fails the load -- the deploy-time
+     guard for a pipeline whose config generation and file placement
+     are decoupled. Under "brotli_dcb_dict_trust_hashes on" (sibling
+     #220) the literal is trusted verbatim as the negotiation key and
+     the hashing pass is skipped -- the config-load cost at scale is
+     the SHA-256 itself, not the read, and the deploy tooling that
      generates the directive list has typically just computed these
-     hashes anyway (deduplication). The trade, and why the argument is
-     opt-in: with a self-computed hash a file that changes on disk after
-     clients stored it simply stops matching (safe fallback to plain
-     br); a stale supplied hash instead keeps matching, and the
-     responses may fail to decode or silently decode to WRONG content
-     (a same-size stale raw dictionary yields wrong bytes — the dcb
-     stream carries no content checksum). The generator owns hash
-     correctness — content-hashed immutable assets are the intended use.
+     hashes anyway. The trade the opt-in states: a stale supplied hash
+     keeps matching, and the responses may fail to decode or silently
+     decode to WRONG content (a same-size stale raw dictionary yields
+     wrong bytes -- the dcb stream carries no content checksum). The
+     generator owns hash correctness; content-hashed immutable assets
+     are the intended use.
 
      Validated before the file is opened so a malformed literal is
-     reported as such, not shadowed by file errors. */
+     reported as such, not shadowed by file errors -- under either
+     policy. */
   have_hash = (cf->args->nelts == 3);
 
   if (have_hash) {
@@ -1633,6 +1736,18 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   if (bmcf->dict_strict_path != 1 && !bmcf->dict_loaded_before_strict_on) {
     bmcf->dict_loaded_before_strict_on = 1;
     bmcf->dict_loaded_before_strict_on_file = path;
+  }
+
+  /* Same raw-read reasoning for the trust flag: a later
+     "brotli_dcb_dict_trust_hashes on;" has not been parsed yet, so a
+     literal verified here silently pays the pass the operator asked
+     to skip. Record; init_main_conf rejects the ordering if the final
+     value is "on". Only literal-carrying lines are affected. */
+  trust = (bmcf->dcb_dict_trust_hashes == 1);
+
+  if (have_hash && !trust && !bmcf->dcb_dict_verified_before_trust_on) {
+    bmcf->dcb_dict_verified_before_trust_on = 1;
+    bmcf->dcb_dict_verified_before_trust_on_file = path;
   }
 
   /* O_NONBLOCK always (zstd sibling #165): a FIFO at the dictionary
@@ -1786,17 +1901,44 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     return NGX_CONF_ERROR;
   }
 
-  if (have_hash) {
+  if (have_hash && trust) {
+    /* Trusted verbatim: the literal IS the negotiation key, the
+       hashing pass -- including its $brotli_dcb_dicts_hashed
+       increment, which is what makes the skip observable -- does not
+       run for this line. */
     ngx_memcpy(dict->hash, hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
+
   } else {
     ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+    bmcf->dcb_dicts_hashed++;
+
+    if (have_hash &&
+        ngx_memcmp(hash, dict->hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) !=
+            0) {
+      u_char hex[2 * NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
+      ngx_str_t hexstr;
+
+      hexstr.data = hex;
+      hexstr.len =
+          ngx_hex_dump(hex, dict->hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) -
+          hex;
+
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "dcb dictionary \"%V\" does not match the supplied "
+                         "hash \"%V\": the file's SHA-256 is \"%V\" (use "
+                         "\"brotli_dcb_dict_trust_hashes on\" only if your "
+                         "deploy pipeline owns hash correctness)",
+                         &path, &value[2], &hexstr);
+      return NGX_CONF_ERROR;
+    }
   }
 
   /* Two entries with the same hash make the negotiation lookup
-     ambiguous (for computed hashes that means identical content under
-     two paths — almost certainly a copy meant to be a new version;
-     supplied hashes are compared as declared). Fail loudly at load
-     rather than silently matching the first. */
+     ambiguous (for computed or verified hashes that means identical
+     content under two paths — almost certainly a copy meant to be a
+     new version; under trust_hashes a literal is compared as declared,
+     which also catches one literal pasted onto two lines). Fail loudly
+     at load rather than silently matching the first. */
   dicts = blcf->dcb_dicts->elts;
 
   for (i = 0; i + 1 < blcf->dcb_dicts->nelts; i++) {

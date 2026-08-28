@@ -414,46 +414,47 @@ Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 
 
 
-=== TEST 16: supplied hash is trusted verbatim as the negotiation key
-# The directive declares a hash that is NOT the file's: negotiation must
-# key on the declared value (client presenting it gets dcb). This does
-# NOT prove the hashing pass was skipped — the branch overwrites
-# dict->hash either way; that evidence is the zero user-time benchmark
-# (see nginx-zstd-module#100 for the instrumentation idea).
+=== TEST 16: a supplied hash that is not the file's aborts config load
+# zstd sibling #198, ported with its #220 companion: the literal is
+# VERIFIED by default. The dictionary path exists and its contents are
+# fine — only the declared hash is wrong — so nothing but the
+# verification can reject this config. The old trusted-verbatim
+# contract this block used to pin lives on behind
+# brotli_dcb_dict_trust_hashes (TEST 28).
 --- config eval
 "    location /t {
         brotli on;
         brotli_min_length 8;
         brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::odd_hex;
         default_type text/html;
-        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+        return 200 \"unreachable\n\";
     }"
 --- request
 GET /t
---- more_headers eval
-"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::odd_b64:"
---- response_headers
-Content-Encoding: dcb
+--- must_die
+--- error_log eval
+qr/does not match the supplied hash "$::odd_hex": the file's SHA-256 is "$::dict_hex"/
 --- no_error_log
-[error]
+[alert]
 
 
 
-=== TEST 17: supplied hash trusted verbatim — the file's true hash no longer matches
+=== TEST 17: the verify pass is real — a correct literal is hashed, counted
+# $brotli_dcb_dicts_hashed counts load-time SHA-256 passes. A verified
+# literal reads 1 here; restoring the old trust-verbatim default (or
+# substituting the literal without hashing) reads 0 and fails — the
+# counter is what distinguishes verifying from trusting, closing the
+# evidence gap the old TEST 16 comment admitted (nginx-zstd-module#100).
 --- config eval
 "    location /t {
-        brotli on;
-        brotli_min_length 8;
-        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::odd_hex;
-        default_type text/html;
-        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::dict_hex;
+        default_type text/plain;
+        return 200 \"hashed=\$brotli_dcb_dicts_hashed\n\";
     }"
 --- request
 GET /t
---- more_headers eval
-"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
---- response_headers
-Content-Encoding: br
+--- response_body
+hashed=1
 --- no_error_log
 [error]
 
@@ -650,5 +651,112 @@ a symlink at any component is refused
 --- must_die
 --- error_log
 is not a regular file
+--- no_error_log
+[alert]
+
+=== TEST 28: trust_hashes on — the declared literal IS the negotiation key
+# The opt-out's contract (zstd sibling #220), proven the only
+# observable way: the literal deliberately does not match the file,
+# and the client advertising the DECLARED value gets dcb — the exact
+# config that is TEST 16's must_die under the default. The file's true
+# hash correspondingly no longer matches (second request).
+--- http_config
+    brotli_dcb_dict_trust_hashes on;
+--- config eval
+"    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::odd_hex;
+        default_type text/html;
+        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+    }"
+--- request eval
+["GET /t", "GET /t"]
+--- more_headers eval
+["Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::odd_b64:",
+ "Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"]
+--- response_headers eval
+["Content-Encoding: dcb",
+ "Content-Encoding: br"]
+--- no_error_log
+[error]
+
+
+
+=== TEST 29: trust_hashes on — the hashing pass is actually skipped
+# The perf contract, witnessed by the counter TEST 17 pins at 1 for
+# the same line shape under the default: a trusted literal contributes
+# ZERO. Substituting the literal after hashing anyway (trust as a
+# no-op) produces the same negotiation key but reads 1 here.
+--- http_config
+    brotli_dcb_dict_trust_hashes on;
+--- config eval
+"    location /t {
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::dict_hex;
+        default_type text/plain;
+        return 200 \"hashed=\$brotli_dcb_dicts_hashed\n\";
+    }"
+--- request
+GET /t
+--- response_body
+hashed=0
+--- no_error_log
+[error]
+
+
+
+=== TEST 30: trust_hashes on — a line without a literal is still hashed
+# Trust changes what a SUPPLIED literal means, nothing else: an
+# unhashed line has nothing to trust, so it is computed as always.
+--- http_config
+    brotli_dcb_dict_trust_hashes on;
+--- config
+    location /t {
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js;
+        default_type text/plain;
+        return 200 "hashed=$brotli_dcb_dicts_hashed\n";
+    }
+--- request
+GET /t
+--- response_body
+hashed=1
+--- no_error_log
+[error]
+
+
+
+=== TEST 31: trust_hashes declared AFTER a literal line is a config error
+# Same ordering trap and remedy as brotli_dcb_dict_strict_path: the
+# flag is read at parse time, so a literal above the "on" line was
+# verified — correct bytes, but the pass the directive exists to skip
+# was silently paid. Reject rather than be quietly position-dependent.
+--- http_config eval
+"brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::dict_hex;
+ brotli_dcb_dict_trust_hashes on;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+"brotli_dcb_dict_trust_hashes on" was declared AFTER
+--- no_error_log
+[alert]
+
+
+
+=== TEST 32: trust_hashes on does not excuse a malformed literal
+# Trust changes what a well-formed literal means, not what a malformed
+# one does: syntax is validated before the file is opened under either
+# policy.
+--- http_config
+    brotli_dcb_dict_trust_hashes on;
+--- config
+    location /t {
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js zz11;
+        default_type text/plain;
+        return 200 "unreachable\n";
+    }
+--- must_die
+--- error_log
+invalid dcb dictionary hash
 --- no_error_log
 [alert]

@@ -70,17 +70,26 @@ against current nginx. Differences from upstream:
   occurrence loads one dictionary — typically a previous version of the
   resource — and registers its SHA-256 as the negotiation key. An
   optional second argument supplies that SHA-256 as 64 hex characters —
-  `brotli_dcb_dict_file /path/main-AAA.js <sha256hex>;` — and is
-  trusted verbatim, skipping the load-time hashing pass entirely; deploy
-  tooling that generates the directive list has usually just computed
-  the hashes anyway (see [`examples/`](examples/)). Only supply hashes
-  for content-hashed immutable assets: a *stale* supplied hash keeps
-  matching, and the resulting responses may fail to decode or silently
-  decode to wrong content (a same-size stale dictionary yields wrong
-  bytes — the dcb stream carries no content checksum), fanned out by
-  any shared cache to every client advertising the stale hash; a
-  self-computed hash of a changed file simply stops matching (safe
-  fallback to plain `br`). A request
+  `brotli_dcb_dict_file /path/main-AAA.js <sha256hex>;` — **verified**
+  by default against the bytes read (zstd siblings' #198): a mismatch
+  fails the load, catching a dictionary replaced or truncated behind
+  the config at `nginx -t` instead of at clients.
+  `brotli_dcb_dict_trust_hashes on;` (`http` only, default `off`,
+  siblings' #220) opts out: the literal is then trusted verbatim as
+  the negotiation key and the load-time hashing pass — the config-load
+  cost at scale — is skipped; lines without a literal are hashed under
+  either policy, and `$brotli_dcb_dicts_hashed` counts the passes so
+  the skip is observable. Deploy tooling that generates the directive
+  list has usually just computed the hashes anyway (see
+  [`examples/`](examples/)). Only trust hashes for content-hashed
+  immutable assets: a *stale* trusted hash keeps matching, and the
+  resulting responses may fail to decode or silently decode to wrong
+  content (a same-size stale dictionary yields wrong bytes — the dcb
+  stream carries no content checksum), fanned out by any shared cache
+  to every client advertising the stale hash; a self-computed hash of
+  a changed file simply stops matching (safe fallback to plain `br`).
+  The trust directive must precede every `brotli_dcb_dict_file`
+  carrying a literal; declaring it after one is a config-load error. A request
   whose `Available-Dictionary` matches a loaded dictionary and whose
   `Accept-Encoding` lists `dcb` explicitly (the `*` wildcard deliberately
   does not match) gets the response compressed against that dictionary
