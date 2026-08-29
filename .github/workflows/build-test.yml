@@ -1,13 +1,19 @@
 name: Build & Test
 
 # Third-party actions are pinned to commit SHAs for supply-chain safety.
-# actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/cache@v4    -> 0057852bfaa89a56745cba8c7296529d2fc39830
+# actions/checkout@v5.1.0 -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+# actions/cache@v5.1.0    -> caa296126883cff596d87d8935842f9db880ef25
 
 env:
   # Resolved at run time by the `resolve` job; nginx.org only keeps the
   # newest mainline tarball, so a hardcoded version eventually 404s.
   NGINX_VERSION: ""
+  # Single source of truth for both cpanm sites below (the zstd
+  # sibling's #214): an unpinned `cpanm Test::Nginx::Socket` resolves
+  # to whatever CPAN serves at run time, so a cold runner can silently
+  # change test behaviour with no repository diff. 0.32 is what every
+  # site already resolved to — a reproducibility pin, not a bump.
+  TEST_NGINX_SOCKET_VERSION: "0.32"
 
 on:
   push:
@@ -59,7 +65,7 @@ jobs:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
     steps:
       - name: Checkout module (no submodule — system mode must not need it)
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install dependencies
         run: |
@@ -126,15 +132,24 @@ jobs:
           echo "✓ system-libbrotli roundtrip passed"
 
       - name: Cache Perl modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/perl5
-          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
         run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          cpanm -l ~/perl5 --notest "Test::Nginx::Socket@${TEST_NGINX_SOCKET_VERSION}"
           echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
+          # Assert the pin held, cache restore or fresh install alike
+          # (the sibling's #214 shape): drift fails loudly HERE, not as
+          # a confusing suite failure downstream.
+          installed="$(perl -I "$HOME/perl5/lib/perl5" -MTest::Nginx::Socket -e 'print $Test::Nginx::Socket::VERSION')"
+          echo "Test::Nginx::Socket installed version: $installed"
+          if [ "$installed" != "$TEST_NGINX_SOCKET_VERSION" ]; then
+            echo "::error::Test::Nginx::Socket version mismatch: pinned $TEST_NGINX_SOCKET_VERSION, got $installed"
+            exit 1
+          fi
 
       - name: Run regression suite
         run: |
@@ -182,7 +197,7 @@ jobs:
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
     steps:
       - name: Checkout module (no submodule — system mode must not need it)
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install dependencies
         run: |
@@ -197,15 +212,24 @@ jobs:
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
 
       - name: Cache Perl modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/perl5
-          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
         run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          cpanm -l ~/perl5 --notest "Test::Nginx::Socket@${TEST_NGINX_SOCKET_VERSION}"
           echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
+          # Assert the pin held, cache restore or fresh install alike
+          # (the sibling's #214 shape): drift fails loudly HERE, not as
+          # a confusing suite failure downstream.
+          installed="$(perl -I "$HOME/perl5/lib/perl5" -MTest::Nginx::Socket -e 'print $Test::Nginx::Socket::VERSION')"
+          echo "Test::Nginx::Socket installed version: $installed"
+          if [ "$installed" != "$TEST_NGINX_SOCKET_VERSION" ]; then
+            echo "::error::Test::Nginx::Socket version mismatch: pinned $TEST_NGINX_SOCKET_VERSION, got $installed"
+            exit 1
+          fi
 
       - name: Run regression suite (sanitized)
         run: |
@@ -239,7 +263,7 @@ jobs:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
     steps:
       - name: Checkout module with submodule
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: true
 
