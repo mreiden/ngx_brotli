@@ -684,7 +684,13 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
       ctx->bytes_out += available_output;
       ctx->out_buf->last_buf = 0;
       ctx->out_buf->flush = 0;
-      if (ctx->end_of_input && BrotliEncoderIsFinished(ctx->encoder)) {
+      /* !HasMoreOutput alongside IsFinished (zstd siblings' round-4
+         twin): IsFinished alone rests on the undocumented invariant
+         that a finished encoder never holds output — marking last_buf
+         on this buf while output remained would truncate the stream.
+         The conjunct costs nothing. */
+      if (ctx->end_of_input && BrotliEncoderIsFinished(ctx->encoder) &&
+          !BrotliEncoderHasMoreOutput(ctx->encoder)) {
         ctx->out_buf->last_buf = 1;
         r->connection->buffered &= ~NGX_HTTP_BROTLI_BUFFERED;
       } else if (ctx->end_of_block) {
@@ -699,7 +705,8 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
       continue;
     }
 
-    if (BrotliEncoderIsFinished(ctx->encoder)) {
+    if (BrotliEncoderIsFinished(ctx->encoder) &&
+        !BrotliEncoderHasMoreOutput(ctx->encoder)) {
       ctx->success = 1;
       r->connection->buffered &= ~NGX_HTTP_BROTLI_BUFFERED;
       ngx_http_brotli_filter_close(ctx);
@@ -861,10 +868,14 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
     ok = BrotliEncoderSetParameter(ctx->encoder, BROTLI_PARAM_SIZE_HINT,
                                    hint);
     if (!ok) {
-      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                    "BrotliEncoderSetParameter(SIZE_HINT, %uD) failed",
+      /* Do what the comment above always promised (zstd siblings'
+         round-4 twin): a refused hint is a lost optimization, not a
+         lost response — the old return NGX_ERROR here failed a
+         request the encoder would have served fine unhinted. */
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "BrotliEncoderSetParameter(SIZE_HINT, %uD) refused; "
+                    "continuing unhinted",
                     hint);
-      return NGX_ERROR;
     }
   }
 
@@ -1856,19 +1867,23 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   }
 #endif
 
+  /* off_t bound BEFORE the size_t narrowing (zstd siblings' round-4
+     R3-9 twin): on ILP32 a 4 GiB file assigned to size_t loads as its
+     low 32 bits, sails under the limit, hashes clean, and serves. */
+  if (ngx_file_size(&info) > (off_t)NGX_HTTP_BROTLI_MAX_DICT_SIZE) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" too large: %O bytes "
+                       "(limit: %d bytes)",
+                       &path, ngx_file_size(&info),
+                       NGX_HTTP_BROTLI_MAX_DICT_SIZE);
+    goto failed;
+  }
+
   size = ngx_file_size(&info);
 
   if (size == 0) {
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "dcb dictionary \"%V\" is empty",
                        &path);
-    goto failed;
-  }
-
-  if (size > NGX_HTTP_BROTLI_MAX_DICT_SIZE) {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "dcb dictionary \"%V\" too large: %uz bytes "
-                       "(limit: %d bytes)",
-                       &path, size, NGX_HTTP_BROTLI_MAX_DICT_SIZE);
     goto failed;
   }
 
