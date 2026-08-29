@@ -138,18 +138,16 @@ jobs:
           key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
+        # The sibling's #214 + #249 shape: the version pin alone still
+        # trusts the CPAN index at run time, so the script also asserts
+        # the version->dist resolution and diffs the resolver's
+        # dependency graph against tools/test-nginx-socket.cpan.lock
+        # before installing. Drift fails loudly HERE, cache restore or
+        # fresh install alike, not as a confusing suite failure
+        # downstream.
         run: |
-          cpanm -l ~/perl5 --notest "Test::Nginx::Socket@${TEST_NGINX_SOCKET_VERSION}"
+          bash tools/install_test_nginx_socket.sh --local-lib ~/perl5
           echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
-          # Assert the pin held, cache restore or fresh install alike
-          # (the sibling's #214 shape): drift fails loudly HERE, not as
-          # a confusing suite failure downstream.
-          installed="$(perl -I "$HOME/perl5/lib/perl5" -MTest::Nginx::Socket -e 'print $Test::Nginx::Socket::VERSION')"
-          echo "Test::Nginx::Socket installed version: $installed"
-          if [ "$installed" != "$TEST_NGINX_SOCKET_VERSION" ]; then
-            echo "::error::Test::Nginx::Socket version mismatch: pinned $TEST_NGINX_SOCKET_VERSION, got $installed"
-            exit 1
-          fi
 
       - name: Run regression suite
         run: |
@@ -218,18 +216,16 @@ jobs:
           key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
+        # The sibling's #214 + #249 shape: the version pin alone still
+        # trusts the CPAN index at run time, so the script also asserts
+        # the version->dist resolution and diffs the resolver's
+        # dependency graph against tools/test-nginx-socket.cpan.lock
+        # before installing. Drift fails loudly HERE, cache restore or
+        # fresh install alike, not as a confusing suite failure
+        # downstream.
         run: |
-          cpanm -l ~/perl5 --notest "Test::Nginx::Socket@${TEST_NGINX_SOCKET_VERSION}"
+          bash tools/install_test_nginx_socket.sh --local-lib ~/perl5
           echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
-          # Assert the pin held, cache restore or fresh install alike
-          # (the sibling's #214 shape): drift fails loudly HERE, not as
-          # a confusing suite failure downstream.
-          installed="$(perl -I "$HOME/perl5/lib/perl5" -MTest::Nginx::Socket -e 'print $Test::Nginx::Socket::VERSION')"
-          echo "Test::Nginx::Socket installed version: $installed"
-          if [ "$installed" != "$TEST_NGINX_SOCKET_VERSION" ]; then
-            echo "::error::Test::Nginx::Socket version mismatch: pinned $TEST_NGINX_SOCKET_VERSION, got $installed"
-            exit 1
-          fi
 
       - name: Run regression suite (sanitized)
         run: |
