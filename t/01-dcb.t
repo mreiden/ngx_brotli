@@ -760,3 +760,28 @@ hashed=1
 invalid dcb dictionary hash
 --- no_error_log
 [alert]
+
+=== TEST 33: a dictionary above the 10 MB limit is a config-load error
+# Pins the off_t bound that now runs BEFORE the size_t narrowing (zstd
+# siblings' round-4 R3-9 twin): on ILP32 the old order let a 4 GiB
+# file load as its low 32 bits, sail under this limit, hash clean and
+# serve. The wrap itself needs a 32-bit rig; this pins the bound and
+# its message so the check cannot silently vanish.
+--- http_config eval
+do {
+    my $big = "$::walkdir/oversize.dict";
+    if (!-e $big) {
+        open my $h, '>', $big or die "spew: $!";
+        seek $h, 10 * 1024 * 1024, 0;
+        print $h "x";
+        close $h;
+    }
+    "brotli_dcb_dict_file $big;";
+}
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+too large
+--- no_error_log
+[alert]

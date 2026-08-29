@@ -161,6 +161,74 @@ jobs:
       - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
         run: bash tools/test_read_dict_file_unit.sh
 
+  # ── ASan+UBSan over the chain-state paths ──────────────────────────────
+  # The zstd siblings' round-4 lesson, applied here: the filter's buffer
+  # and state-machine code never ran under a sanitizer, and their job's
+  # first run caught real UB (upstream-nginx's, but caught). Both suites
+  # and both wire tools run against the sanitized binary; everything is
+  # fatal, leak checking off (LSan's ptrace-dependent exit check is the
+  # flaky machinery the zstd repo wraps in verdict scripts). Both suites
+  # run at warn log level, so nginx core's debug-log UB sites (the
+  # nonnull family nginx PRs #1671/#1672 and #1679-#1682 address) never
+  # execute and no check class needs disabling.
+  build-asan:
+    name: ASan+UBSan (suites and wire tools)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+    steps:
+      - name: Checkout module (no submodule — system mode must not need it)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config wget \
+            libpcre2-dev zlib1g-dev libbrotli-dev brotli python3 \
+            libperl-dev cpanminus
+
+      - name: Build against PGP-verified nginx (sanitized)
+        run: |
+          NGX_BROTLI_SANITIZE=1 bash tools/ci-build.sh system "$NGINX_VERSION"
+          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Cache Perl modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/perl5
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+
+      - name: Install Test::Nginx::Socket
+        run: |
+          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
+
+      - name: Run regression suite (sanitized)
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-brotli-asan
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/00-brotli.t
+
+      - name: Run dcb negotiation suite (sanitized)
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-dcb-asan
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/01-dcb.t
+
+      - name: Roundtrip smoke test (sanitized)
+        run: |
+          python3 tools/test_encoding.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18280
+
+      - name: dcb wire-format test (sanitized)
+        run: |
+          python3 tools/test_dcb.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18290
+
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:
     name: Build & smoke (bundled brotli v1.2.0)

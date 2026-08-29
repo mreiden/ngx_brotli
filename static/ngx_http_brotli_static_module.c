@@ -120,21 +120,18 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   cfg = ngx_http_get_module_loc_conf(req, ngx_http_brotli_static_module);
   if (cfg->enable == NGX_HTTP_BROTLI_STATIC_OFF) return NGX_DECLINED;
 
-  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ALWAYS) {
-    /* Ignore request properties (e.g. Accept-Encoding). */
-  } else {
-    /* NGX_HTTP_BROTLI_STATIC_ON: emit Vary: Accept-Encoding by
-       construction (parent #163), not via r->gzip_vary — whose backing
-       "gzip_vary" directive defaults to off, under which no Vary is
-       emitted and a shared cache could serve .br to a client that cannot
-       decode it. "always" mode stays exempt: it ignores Accept-Encoding,
-       so the response genuinely does not vary on it. */
-    if (ngx_http_brotli_vary_accept_encoding(req) != NGX_OK) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    rc = check_eligility(req);
-    if (rc != NGX_OK) return NGX_DECLINED;
-  }
+  /* NGX_HTTP_BROTLI_STATIC_ON's Vary and acceptance check both moved
+     BELOW the file checks (zstd siblings' #202, their round-4 ruling):
+     Vary is earned by a USABLE .br — here existence + regular file,
+     since this module deliberately does no content validation — not by
+     the attempt. A URI with no usable .br is not a negotiated variant,
+     and stamping Vary on its identity response fragmented shared
+     caches for nothing. The flip side, the ruling's condition: the
+     probe runs before the acceptance check, so a NON-accepting client
+     still learns the URI varies when a usable .br exists — without
+     that, its identity response would enter shared caches
+     unpartitioned. "always" is unchanged: it ignores Accept-Encoding
+     and never varies. */
 
   /* Get path and append the suffix. */
   last = ngx_http_map_uri_to_path(req, &path, &root, kSuffixLen);
@@ -207,11 +204,25 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   }
 #endif
 
-  /* The .br file exists and will be served: NOW suppress a later gzip
-     filter/handler (moved from check_eligility — latching before the
-     file was known to exist killed the gzip_static fallback). ALWAYS
-     mode never consulted Accept-Encoding, so it never latched. */
+  /* The .br is proven usable: the URI genuinely varies, so the header
+     goes out now (parent #163's by-construction emission at #202's
+     placement) — on the serve path AND on the non-accepting decline
+     below. */
   if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
+    if (ngx_http_brotli_vary_accept_encoding(req) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* Acceptance decides serve-vs-decline, never probe-vs-skip. The
+       gzip latch below must NOT fire on this decline: a brotli-refusing
+       gzip-accepting client still deserves the gzip_static fallback. */
+    rc = check_eligility(req);
+    if (rc != NGX_OK) return NGX_DECLINED;
+
+    /* The .br file exists and will be served: NOW suppress a later gzip
+       filter/handler (latching before the file was known to exist
+       killed the gzip_static fallback). ALWAYS mode never consulted
+       Accept-Encoding, so it never latched. */
     req->gzip_tested = 1;
     req->gzip_ok = 0;
   }

@@ -586,3 +586,50 @@ Accept-Encoding: br;foo=bar;q=0
 --- raw_response_headers_unlike: Content-Encoding
 --- no_error_log
 [error]
+
+=== TEST 23: brotli_static on with no .br earns no Vary (#202 mirror)
+# zstd siblings' #202, their round-4 ruling: Vary is earned by a
+# USABLE .br (existence + regular file here — this module deliberately
+# validates no content), not by the attempt. A URI with no .br at all
+# is not a negotiated variant; the old early emission stamped Vary on
+# its identity response and fragmented shared caches for nothing.
+--- config
+    location /st/ {
+        brotli_static on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br
+--- raw_response_headers_unlike: Vary
+--- response_body eval
+$::src
+--- no_error_log
+[error]
+
+
+=== TEST 24: usable .br + non-accepting client -> Vary, identity, no latch
+# The ruling's condition: the probe runs before the acceptance check,
+# so a client refusing br still learns the URI varies when a usable
+# .br exists — without that, its identity response would enter shared
+# caches unpartitioned and poison the URI for every br-accepting
+# client behind the same cache. Exists to fail the naive
+# acceptance-before-probe variant.
+--- config
+    location /st/ {
+        brotli_static on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: gzip
+--- raw_response_headers_like: Vary: Accept-Encoding
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- no_error_log
+[error]

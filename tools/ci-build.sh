@@ -132,10 +132,26 @@ fi
 
 cd "$SRCDIR"
 
+# NGX_BROTLI_SANITIZE=1 (CI only): build under ASan+UBSan, everything
+# fatal. The zstd siblings' round-4 lesson: chain-state code deserves a
+# sanitizer pass, and their job's first run caught real (upstream-nginx)
+# UB. Both suites here run at warn log level, so nginx core's own
+# debug-log UB sites (the nonnull-attribute family the in-flight nginx
+# PRs #1671/#1672 and #1679-#1682 address) never execute — no check
+# class needs disabling.
+san_cc=""
+san_ld=""
+if [ "${NGX_BROTLI_SANITIZE:-0}" = "1" ]; then
+    san_cc="--with-cc-opt=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+    san_ld="--with-ld-opt=-fsanitize=address,undefined"
+fi
+
 ./configure \
     --with-compat \
     --with-debug \
     --with-http_gzip_static_module \
+    ${san_cc:+"$san_cc"} \
+    ${san_ld:+"$san_ld"} \
     --add-module="$MODULE_DIR" > /dev/null
 
 make -j"$(nproc)" 2>&1 | tail -3
