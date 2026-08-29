@@ -633,3 +633,101 @@ Accept-Encoding: gzip
 $::src
 --- no_error_log
 [error]
+
+
+=== TEST 25: Cache-Control no-transform serves identity (parent #251)
+# The gate only sees headers present BEFORE the filter chain runs, so
+# the fixture arrives via a proxied origin — an add_header in the
+# outer location would be added after this filter already decided.
+--- config
+    location /origin {
+        add_header Cache-Control "no-transform";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: no-transform fixture text line
+--- no_error_log
+[error]
+
+
+=== TEST 26: Cache-Control public still compresses (negative control)
+--- config
+    location /origin {
+        add_header Cache-Control "public";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 27: a quoted parameter VALUE of no-transform is not a directive
+# extension="no-transform" names the string, not the directive — the
+# walker cuts each segment at '='/';' and whole-token-compares.
+--- config
+    location /origin {
+        add_header Cache-Control "public, extension=\"no-transform\"";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 28: no-transform with OWS, a parameter, and a second line
+# " public ; max-age=60 " on the first line, No-Transform (mixed case)
+# on a SECOND Cache-Control line: caches read the union, so must we.
+--- config
+    location /origin {
+        add_header Cache-Control " public ; max-age=60 ";
+        add_header Cache-Control "No-Transform";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: no-transform fixture text line
+--- no_error_log
+[error]

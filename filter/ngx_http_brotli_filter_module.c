@@ -167,6 +167,9 @@ static void ngx_http_brotli_filter_free(void* opaque, void* address);
 
 static ngx_int_t ngx_http_brotli_check_request(ngx_http_request_t* r);
 
+static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc);
+static ngx_int_t ngx_http_brotli_no_transform(ngx_http_request_t* r);
+
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf);
 static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
@@ -384,6 +387,99 @@ static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
    tokens out of quoted parameter values, ignored ";Q=0" refusals, and
    treated malformed weights as acceptance. */
 
+/* Does one Cache-Control value carry a no-transform DIRECTIVE (RFC 9111
+   §5.2.2.6)? Directives are comma-separated; everything from the first
+   ';' or '=' onward in a segment is parameter/argument text, so a quoted
+   parameter VALUE like extension="no-transform" does not match (parent
+   nginx-zstd-module #251's walker, with the '=' cut added). */
+static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc) {
+  u_char* p;
+  u_char* last;
+  u_char* start;
+  u_char* end;
+  u_char* cut;
+
+  p = cc->value.data;
+  last = p + cc->value.len;
+
+  while (p < last) {
+    start = p;
+    while (start < last && (*start == ' ' || *start == '\t')) {
+      start++;
+    }
+
+    end = start;
+    while (end < last && *end != ',') {
+      end++;
+    }
+
+    cut = start;
+    while (cut < end && *cut != ';' && *cut != '=') {
+      cut++;
+    }
+    end = cut;
+
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+      end--;
+    }
+
+    if ((size_t)(end - start) == sizeof("no-transform") - 1 &&
+        ngx_strncasecmp(start, (u_char*)"no-transform",
+                        sizeof("no-transform") - 1) == 0) {
+      return 1;
+    }
+
+    p = cut;
+    while (p < last && *p != ',') {
+      p++;
+    }
+    if (p < last) {
+      p++;
+    }
+  }
+
+  return 0;
+}
+
+/* RFC 9110 §7.7: no-transform forbids changing the content coding. The
+   walk covers the whole headers_out list rather than the
+   headers_out.cache_control chain because only some producers (the
+   upstream module) wire that chain — a Cache-Control pushed straight
+   onto the list by a module is invisible there. Repeated Cache-Control
+   lines are each checked (caches treat them as one combined list). */
+static ngx_int_t ngx_http_brotli_no_transform(ngx_http_request_t* r) {
+  ngx_uint_t i;
+  ngx_list_part_t* part;
+  ngx_table_elt_t* h;
+
+  part = &r->headers_out.headers.part;
+  h = part->elts;
+
+  for (i = 0; /* void */; i++) {
+    if (i >= part->nelts) {
+      if (part->next == NULL) {
+        break;
+      }
+      part = part->next;
+      h = part->elts;
+      i = 0;
+    }
+
+    if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1 ||
+        h[i].value.len == 0) {
+      continue;
+    }
+
+    if (ngx_strncasecmp(h[i].key.data, (u_char*)"Cache-Control",
+                        sizeof("Cache-Control") - 1) == 0 &&
+        ngx_http_brotli_cc_value_no_transform(&h[i])) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 /* Process headers and decide if request is eligible for brotli compression. */
 static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
   ngx_table_elt_t* h;
@@ -433,6 +529,16 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
 
   /* Compress only certain MIME-typed responses. */
   if (ngx_http_test_content_type(r, &conf->types) == NULL) {
+    return ngx_http_next_header_filter(r);
+  }
+
+  /* RFC 9110 §7.7 (parent nginx-zstd-module #251): a response carrying
+     Cache-Control: no-transform must keep its content coding. Sits
+     before any Vary emission — the skip is keyed on a response header,
+     so the response does not vary on Accept-Encoding. Matching the
+     parent's standalone semantics, core gzip is left alone: this module
+     falls through, same as the bypass below. */
+  if (ngx_http_brotli_no_transform(r)) {
     return ngx_http_next_header_filter(r);
   }
 
