@@ -248,6 +248,16 @@ typedef struct {
      after hashing anyway -- the evidence gap the old trusted-verbatim
      test admitted it could not close. */
   ngx_uint_t dcb_dicts_hashed;
+
+  /* One EVP digest context reused across every hash this config load
+     computes (the zstd sibling's #262): lazily created on the first
+     computed hash, freed with cf->pool when parsing ends. void* so no
+     OpenSSL types leak into this struct; NULL (creation failed, or no
+     libcrypto) makes every hash take the portable path -- the same
+     total-function contract as before. Only the dict_file handler
+     touches it, and only during parse. */
+  void* dcb_evp_md_ctx;
+  ngx_flag_t dcb_evp_md_ctx_attempted;
 } ngx_http_brotli_main_conf_t;
 
 /* Configuration literals. */
@@ -1736,6 +1746,40 @@ static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf) {
   return NGX_CONF_OK;
 }
 
+#if (NGX_HTTP_BROTLI_HAVE_DCB) && (NGX_HTTP_BROTLI_HAVE_LIBCRYPTO)
+
+static void ngx_http_brotli_cleanup_evp_md_ctx(void* data) {
+  EVP_MD_CTX_free(data);
+}
+
+/* Lazy, one-per-config-load EVP context (the zstd sibling's #262):
+   created on the first computed hash, freed with cf->pool when parsing
+   ends. Any failure leaves the pointer NULL and every hash takes the
+   portable path -- attempted is what keeps a failed creation from
+   being retried per dictionary. */
+static void ngx_http_brotli_init_evp_md_ctx(
+    ngx_conf_t* cf, ngx_http_brotli_main_conf_t* bmcf) {
+  ngx_pool_cleanup_t* cln;
+
+  bmcf->dcb_evp_md_ctx_attempted = 1;
+  bmcf->dcb_evp_md_ctx = EVP_MD_CTX_new();
+  if (bmcf->dcb_evp_md_ctx == NULL) {
+    return;
+  }
+
+  cln = ngx_pool_cleanup_add(cf->pool, 0);
+  if (cln == NULL) {
+    EVP_MD_CTX_free(bmcf->dcb_evp_md_ctx);
+    bmcf->dcb_evp_md_ctx = NULL;
+    return;
+  }
+
+  cln->handler = ngx_http_brotli_cleanup_evp_md_ctx;
+  cln->data = bmcf->dcb_evp_md_ctx;
+}
+
+#endif
+
 /* brotli_dcb_dict_file <path> — load one RFC 9842 dictionary. The file
    is read and hashed here at config parse (nginx -t validates it), into
    cf->pool so the raw bytes live exactly as long as the configuration
@@ -2030,7 +2074,13 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     ngx_memcpy(dict->hash, hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
 
   } else {
-    ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+#if (NGX_HTTP_BROTLI_HAVE_DCB) && (NGX_HTTP_BROTLI_HAVE_LIBCRYPTO)
+    if (!bmcf->dcb_evp_md_ctx_attempted) {
+      ngx_http_brotli_init_evp_md_ctx(cf, bmcf);
+    }
+#endif
+    ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash,
+                           bmcf->dcb_evp_md_ctx);
     bmcf->dcb_dicts_hashed++;
 
     if (have_hash &&
