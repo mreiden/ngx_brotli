@@ -114,6 +114,14 @@ if [ ! -d "$SRCDIR" ]; then
     tar -xzf "$TARBALL" -C "$ROOT"
 fi
 
+# The deps/brotli pin is google/brotli's v1.2.0 RELEASE commit, and must
+# stay a release: a gitlink is an opaque SHA, so this assertion is what
+# turns "happens to be the release" into "cannot silently drift to an
+# arbitrary master commit". Bumping to a NEW release means updating BOTH
+# the gitlink and this pair, in one deliberate commit.
+BROTLI_PIN_TAG="v1.2.0"
+BROTLI_PIN_SHA="028fb5a23661f123017c060daa546b55cf4bde29"
+
 if [ "$MODE" = "bundled" ]; then
     # The bundled path expects prebuilt static libs in deps/brotli/c/../out
     # (filter/config links -L<out> -lbrotlienc -lbrotlicommon).
@@ -121,6 +129,22 @@ if [ "$MODE" = "bundled" ]; then
         echo "ERROR: bundled mode needs the submodule:" \
              "git submodule update --init" >&2
         exit 1
+    fi
+
+    have_sha="$(git -C "$MODULE_DIR/deps/brotli" rev-parse HEAD 2>/dev/null || true)"
+    if [ "$have_sha" != "$BROTLI_PIN_SHA" ]; then
+        echo "ERROR: deps/brotli is at ${have_sha:-<unreadable>}, expected" \
+             "$BROTLI_PIN_SHA (the $BROTLI_PIN_TAG release commit)." \
+             "If this is a deliberate release bump, update BROTLI_PIN_TAG/" \
+             "BROTLI_PIN_SHA beside the gitlink in the same commit." >&2
+        exit 1
+    fi
+    # tags may be absent on shallow submodule fetches; the describe is a
+    # nicer confirmation when they are present, never a failure when not
+    if tag="$(git -C "$MODULE_DIR/deps/brotli" describe --tags --exact-match 2>/dev/null)"; then
+        echo "== deps/brotli pinned at release $tag ($BROTLI_PIN_SHA)"
+    else
+        echo "== deps/brotli pinned at $BROTLI_PIN_SHA ($BROTLI_PIN_TAG)"
     fi
     if [ ! -f "$MODULE_DIR/deps/brotli/out/libbrotlienc.a" ]; then
         cmake -S "$MODULE_DIR/deps/brotli" -B "$MODULE_DIR/deps/brotli/out" \
