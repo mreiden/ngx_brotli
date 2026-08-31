@@ -147,21 +147,26 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                 }
 
                 if (*p == '0') {
-                    /* ngx_int_t (not int) so the digit*scale product widens
-                     * before the add. */
-                    ngx_int_t  scale = 100;
-
                     p++;
                     q = 0;
 
+                    /*
+                     * Up to three decimal digits, each with its literal
+                     * milli-unit scale (no loop counter to reason
+                     * about). A fourth digit stays in place for the
+                     * trailing-junk check below to reject.
+                     */
                     if (p < end && *p == '.') {
                         p++;
-                        while (p < end && *p >= '0' && *p <= '9'
-                               && scale > 0)
-                        {
-                            q += (*p - '0') * scale;
-                            scale /= 10;
-                            p++;
+
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += (*p++ - '0') * 100;
+                        }
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += (*p++ - '0') * 10;
+                        }
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += *p++ - '0';
                         }
                     }
 
@@ -299,6 +304,17 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
             p++;
         }
 
+        /*
+         * After the name and OWS only ';' (parameters), ',' (next
+         * element), or end may follow. Anything else ("br x") is
+         * trailing junk: the element matches nothing rather than
+         * negotiating at the implied q=1 below.
+         */
+        if (p < end && *p != ';' && *p != ',') {
+            is_coding = 0;
+            is_star = 0;
+        }
+
         q = 1000;       /* no parameters → q=1 */
         if (p < end && *p == ';') {
             q = ngx_http_brotli_eval_qvalue(ae, p);
@@ -343,10 +359,122 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
 
 
 /*
- * br acceptance predicate over one Accept-Encoding value: NGX_OK iff the
- * effective weight for "br" (explicit token, else "*" wildcard) is > 0.
+ * Whole-request weight lookup: multiple Accept-Encoding lines are
+ * semantically ONE comma-joined field (RFC 9110 section 5.3), so the
+ * lines accumulate under the same precedence the single-value walker
+ * applies within one line — the latest explicit token wins wherever it
+ * appears, and "*" stays subordinate to an explicit token on ANY line.
+ * Reading only the first line would refuse a client that advertised br
+ * on the second, and would honour an allowance a later line revoked
+ * with q=0 — divergence any comma-joining intermediary makes visible.
+ *
+ * The per-line probe runs twice: first wildcard-suppressed, so an
+ * explicit token's verdict (including q=0) is isolated from a "*" on
+ * the same line, then as-asked to collect the wildcard.
+ *
+ * nginx >= 1.23 chains same-name headers through ngx_table_elt_t.next;
+ * older cores keep only the first line in headers_in.accept_encoding,
+ * so there the raw headers list is walked instead.
  */
 static ngx_int_t
+ngx_http_brotli_request_coding_weight(ngx_http_request_t *r,
+    const char *coding, size_t coding_len, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t         q, coding_q, star_q;
+#if nginx_version >= 1023000
+    ngx_table_elt_t  *ae;
+#else
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+#endif
+
+    coding_q = -1;
+    star_q = -1;
+
+#if nginx_version >= 1023000
+
+    for (ae = r->headers_in.accept_encoding; ae != NULL; ae = ae->next) {
+
+        q = ngx_http_brotli_coding_weight(&ae->value, coding, coding_len, 0);
+        if (q >= 0) {
+            coding_q = q;
+            continue;
+        }
+
+        if (!allow_wildcard) {
+            continue;
+        }
+
+        q = ngx_http_brotli_coding_weight(&ae->value, coding, coding_len, 1);
+        if (q >= 0) {
+            star_q = q;
+        }
+    }
+
+#else
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0
+            || h[i].key.len != sizeof("Accept-Encoding") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1)
+               != 0)
+        {
+            continue;
+        }
+
+        q = ngx_http_brotli_coding_weight(&h[i].value, coding, coding_len, 0);
+        if (q >= 0) {
+            coding_q = q;
+            continue;
+        }
+
+        if (!allow_wildcard) {
+            continue;
+        }
+
+        q = ngx_http_brotli_coding_weight(&h[i].value, coding, coding_len, 1);
+        if (q >= 0) {
+            star_q = q;
+        }
+    }
+
+#endif
+
+    if (coding_q >= 0) {
+        return coding_q;
+    }
+    if (allow_wildcard && star_q >= 0) {
+        return star_q;
+    }
+    return -1;
+}
+
+
+/*
+ * br acceptance predicate over one Accept-Encoding value: NGX_OK iff the
+ * effective weight for "br" (explicit token, else "*" wildcard) is > 0.
+ * Production callers negotiate whole-request through
+ * ngx_http_brotli_request_coding_weight(); this single-value shape is
+ * kept as the fuzz harness's entry point (fuzz/extract_parser.sh slices
+ * it out by name). ngx_inline: no in-tree TU calls it any more, and an
+ * inline definition is exempt from -Werror=unused-function.
+ */
+static ngx_inline ngx_int_t
 ngx_http_brotli_accept_encoding(ngx_str_t *ae)
 {
     ngx_int_t  q;
@@ -361,28 +489,23 @@ ngx_http_brotli_accept_encoding(ngx_str_t *ae)
  * ngx_http_brotli_accepts()
  *
  * Side-effect-free acceptance predicate: NGX_OK iff this is a main request
- * whose client advertises acceptable br support. Does NOT touch
- * r->gzip_tested / r->gzip_ok — callers that only need the decision use
- * this. In particular the static module must use THIS before it knows
- * whether a .br file exists: latching gzip off first would suppress a
- * later gzip_static fallback for a client that accepts both br and gzip
- * when only a .gz file is on disk (it previously did exactly that).
+ * whose client advertises acceptable br support across the whole
+ * Accept-Encoding field. Does NOT touch r->gzip_tested / r->gzip_ok —
+ * callers that only need the decision use this. In particular the static
+ * module must use THIS before it knows whether a .br file exists:
+ * latching gzip off first would suppress a later gzip_static fallback
+ * for a client that accepts both br and gzip when only a .gz file is on
+ * disk (it previously did exactly that).
  */
 static ngx_int_t
 ngx_http_brotli_accepts(ngx_http_request_t *r)
 {
-    ngx_table_elt_t  *ae;
-
     if (r != r->main) {
         return NGX_DECLINED;
     }
 
-    ae = r->headers_in.accept_encoding;
-    if (ae == NULL) {
-        return NGX_DECLINED;
-    }
-
-    return ngx_http_brotli_accept_encoding(&ae->value);
+    return ngx_http_brotli_request_coding_weight(r, "br", sizeof("br") - 1, 1)
+           > 0 ? NGX_OK : NGX_DECLINED;
 }
 
 

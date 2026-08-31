@@ -27,7 +27,7 @@ fi
 # the build fails with the "header layout changed?" error misleadingly.
 awk '
     { sub(/\r$/, "") }
-    /^static (ngx_int_t|u_char \*)$/ { pending = 1; buf = $0 ORS; next }
+    /^static (ngx_inline )?(ngx_int_t|u_char \*)$/ { pending = 1; buf = $0 ORS; next }
     pending && /^ngx_http_brotli_(skip_quoted|eval_qvalue|coding_weight|accept_encoding)\(/ {
         capture = 1; pending = 0; print buf; print; next
     }

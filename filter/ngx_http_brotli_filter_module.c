@@ -1166,7 +1166,6 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
   ngx_str_t decoded;
   ngx_uint_t i;
   ngx_table_elt_t* h;
-  ngx_table_elt_t* ae;
   ngx_http_brotli_dcb_dict_t* dicts;
 
   if (conf->dcb_dicts == NULL || conf->dcb_dicts->nelts == 0) {
@@ -1208,8 +1207,7 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     }
   }
 
-  ae = r->headers_in.accept_encoding;
-  if (ae == NULL) {
+  if (r->headers_in.accept_encoding == NULL) {
     return NULL;
   }
 
@@ -1249,8 +1247,11 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     return NULL;
   }
 
-  if (ngx_http_brotli_coding_weight(&ae->value, "dcb", sizeof("dcb") - 1,
-                                    0) <= 0) {
+  /* Whole-field lookup; wildcard-suppressed — only a client that
+     actually holds the dictionary can decode dcb, so a blanket "*"
+     must not turn it on. */
+  if (ngx_http_brotli_request_coding_weight(r, "dcb", sizeof("dcb") - 1,
+                                            0) <= 0) {
     return NULL;
   }
 

@@ -776,3 +776,124 @@ Accept-Encoding: br
 brotli filter body: no-transform fixture text line
 --- no_error_log
 [error]
+
+
+=== TEST 31: trailing junk after the coding name rejects the element
+# "br x" is not a valid element: after the name and OWS only ';', ','
+# or end may follow. The old walker fell through to the implied-q=1
+# default and compressed for a header that names no valid coding.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br x
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: negotiation matrix fixture text
+--- no_error_log
+[error]
+
+
+=== TEST 32: a junk element does not mask a later clean token
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br x, br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 33: br offered only on a second Accept-Encoding line elects br
+# Multiple Accept-Encoding lines are one comma-joined field (RFC 9110
+# section 5.3); reading only the first line refuses a client that
+# advertised br in a way any joining intermediary would surface.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: identity
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 34: a refusal on a later line overrides an earlier allowance
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+Accept-Encoding: br;q=0
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: negotiation matrix fixture text
+--- no_error_log
+[error]
+
+
+=== TEST 35: static: br on a second line serves the precompressed file
+--- config
+    location /st/ {
+        brotli_static on;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: gzip
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- response_body eval
+$::br
+--- no_error_log
+[error]
+
+
+=== TEST 36: an empty first Accept-Encoding line does not mask a later one
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding:
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
