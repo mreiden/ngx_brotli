@@ -897,3 +897,43 @@ Accept-Encoding: br
 Content-Encoding: br
 --- no_error_log
 [error]
+
+
+=== TEST 37: an empty parameter (br;;q=1) is malformed, not q=1
+# RFC 9110 has no empty-parameter production; the old walker read the
+# stray ';' as a skipped valueless parameter and accepted the element
+# at the q=1 that followed (siblings' parent #142 rule, drifted here).
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br;;q=1
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: negotiation matrix fixture text
+--- no_error_log
+[error]
+
+
+=== TEST 38: the malformed element does not poison a later clean token
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br;;q=1, br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]

@@ -28,7 +28,7 @@ against current nginx. Differences from upstream:
 - **Accept-Encoding parsing** is a shared, length-bounded RFC 9110
   walker (ported from nginx-zstd-module, where it is continuously fuzzed
   with an independent differential oracle), replacing two hand-maintained
-  copies of a substring scan. Seven deliberate behaviour changes, all
+  copies of a substring scan. Eight deliberate behaviour changes, all
   toward the RFC: the `*` wildcard now matches `br`; a coding name inside
   a quoted parameter value (e.g. `gzip;x="a, br"`) no longer fabricates a
   phantom `br` token; `;Q=0` refusals are honored (the weight name is
@@ -36,7 +36,9 @@ against current nginx. Differences from upstream:
   instead of defaulting to accept; a later duplicate explicit token
   wins (`br;q=0, br` now accepts); trailing junk after a coding name
   (`br x`) makes its element non-matching instead of negotiating at an
-  implied q=1; and every `Accept-Encoding` line is read as the one
+  implied q=1; an empty parameter (`br;;q=1`, or a trailing `br;`) is
+  malformed rather than a skipped one; and every `Accept-Encoding` line
+  is read as the one
   comma-joined field RFC 9110 defines, so a `br` offered — or refused —
   only on a later line is honored.
 - **`brotli_static` gzip fallback fix:** the old code latched gzip off

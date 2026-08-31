@@ -119,6 +119,18 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
             p++;
         }
         nend = p;
+
+        /*
+         * RFC 9110 has no empty-parameter production, so "br;;q=1"
+         * (and a trailing "br;") is malformed rather than "a skipped
+         * parameter followed by q=1". Reject it instead of silently
+         * resolving the element to q=1 (the siblings' parent #142
+         * rule; this copy had drifted without it).
+         */
+        if (nend == nstart) {
+            return -1;
+        }
+
         is_q = (nend - nstart == 1
                 && (nstart[0] == 'q' || nstart[0] == 'Q'));
 
@@ -376,11 +388,57 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
  * older cores keep only the first line in headers_in.accept_encoding,
  * so there the raw headers list is walked instead.
  */
+/*
+ * One field line folded into the field-wide accumulators, and the
+ * final precedence over them. The two collections in the request
+ * walker below (the ->next chain on nginx >= 1.23, the raw header
+ * list on older cores) may differ per build; the accumulation and
+ * precedence MUST not — a private copy in each branch is how the two
+ * shapes' negotiation drifts apart with only one compiled at a time.
+ */
+static ngx_inline void
+ngx_http_brotli_fold_line_weight(ngx_str_t *value, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard, ngx_int_t *coding_q,
+    ngx_int_t *star_q)
+{
+    ngx_int_t  q;
+
+    q = ngx_http_brotli_coding_weight(value, coding, coding_len, 0);
+    if (q >= 0) {
+        *coding_q = q;      /* comma-joined in received order */
+        return;
+    }
+
+    if (!allow_wildcard) {
+        return;
+    }
+
+    q = ngx_http_brotli_coding_weight(value, coding, coding_len, 1);
+    if (q >= 0) {
+        *star_q = q;        /* only "*" could answer here */
+    }
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_brotli_field_weight(ngx_int_t coding_q, ngx_int_t star_q,
+    ngx_uint_t allow_wildcard)
+{
+    if (coding_q >= 0) {
+        return coding_q;
+    }
+    if (allow_wildcard && star_q >= 0) {
+        return star_q;
+    }
+    return -1;
+}
+
+
 static ngx_int_t
 ngx_http_brotli_request_coding_weight(ngx_http_request_t *r,
     const char *coding, size_t coding_len, ngx_uint_t allow_wildcard)
 {
-    ngx_int_t         q, coding_q, star_q;
+    ngx_int_t         coding_q, star_q;
 #if nginx_version >= 1023000
     ngx_table_elt_t  *ae;
 #else
@@ -395,21 +453,9 @@ ngx_http_brotli_request_coding_weight(ngx_http_request_t *r,
 #if nginx_version >= 1023000
 
     for (ae = r->headers_in.accept_encoding; ae != NULL; ae = ae->next) {
-
-        q = ngx_http_brotli_coding_weight(&ae->value, coding, coding_len, 0);
-        if (q >= 0) {
-            coding_q = q;
-            continue;
-        }
-
-        if (!allow_wildcard) {
-            continue;
-        }
-
-        q = ngx_http_brotli_coding_weight(&ae->value, coding, coding_len, 1);
-        if (q >= 0) {
-            star_q = q;
-        }
+        ngx_http_brotli_fold_line_weight(&ae->value, coding, coding_len,
+                                         allow_wildcard,
+                                         &coding_q, &star_q);
     }
 
 #else
@@ -437,31 +483,14 @@ ngx_http_brotli_request_coding_weight(ngx_http_request_t *r,
             continue;
         }
 
-        q = ngx_http_brotli_coding_weight(&h[i].value, coding, coding_len, 0);
-        if (q >= 0) {
-            coding_q = q;
-            continue;
-        }
-
-        if (!allow_wildcard) {
-            continue;
-        }
-
-        q = ngx_http_brotli_coding_weight(&h[i].value, coding, coding_len, 1);
-        if (q >= 0) {
-            star_q = q;
-        }
+        ngx_http_brotli_fold_line_weight(&h[i].value, coding, coding_len,
+                                         allow_wildcard,
+                                         &coding_q, &star_q);
     }
 
 #endif
 
-    if (coding_q >= 0) {
-        return coding_q;
-    }
-    if (allow_wildcard && star_q >= 0) {
-        return star_q;
-    }
-    return -1;
+    return ngx_http_brotli_field_weight(coding_q, star_q, allow_wildcard);
 }
 
 
