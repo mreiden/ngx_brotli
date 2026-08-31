@@ -408,6 +408,7 @@ static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc) {
   u_char* start;
   u_char* end;
   u_char* cut;
+  u_char* seg_end;
 
   p = cc->value.data;
   last = p + cc->value.len;
@@ -418,13 +419,32 @@ static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc) {
       start++;
     }
 
-    end = start;
-    while (end < last && *end != ',') {
-      end++;
+    /* Segment end = the next comma OUTSIDE any quoted string (zstd
+       sibling's #274): a quoted extension value may contain commas and
+       backslash-escaped characters, and splitting there fabricated a
+       matching segment out of the quoted text -- a false compression
+       opt-out. Computed once, used for the cut and the advance, so the
+       next segment can never start inside a quote. */
+    seg_end = start;
+    while (seg_end < last && *seg_end != ',') {
+      if (*seg_end == '\"') {
+        seg_end++;
+        while (seg_end < last && *seg_end != '\"') {
+          if (*seg_end == '\\' && seg_end + 1 < last) {
+            seg_end++;
+          }
+          seg_end++;
+        }
+        if (seg_end < last) {
+          seg_end++; /* the closing quote */
+        }
+        continue;
+      }
+      seg_end++;
     }
 
     cut = start;
-    while (cut < end && *cut != ';' && *cut != '=') {
+    while (cut < seg_end && *cut != ';' && *cut != '=') {
       cut++;
     }
     end = cut;
@@ -439,13 +459,7 @@ static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc) {
       return 1;
     }
 
-    p = cut;
-    while (p < last && *p != ',') {
-      p++;
-    }
-    if (p < last) {
-      p++;
-    }
+    p = (seg_end < last) ? seg_end + 1 : seg_end;
   }
 
   return 0;

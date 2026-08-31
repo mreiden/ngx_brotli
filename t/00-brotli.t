@@ -731,3 +731,48 @@ Accept-Encoding: br
 brotli filter body: no-transform fixture text line
 --- no_error_log
 [error]
+
+
+=== TEST 29: a quoted extension value containing commas is NOT split (#274 twin)
+--- config
+    location /origin {
+        add_header Cache-Control "public, x=\",no-transform,y\"";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 30: a real no-transform AFTER a comma-carrying quoted value matches
+--- config
+    location /origin {
+        add_header Cache-Control "x=\"a,b\", no-transform";
+        default_type text/html;
+        return 200 "brotli filter body: no-transform fixture text line\n";
+    }
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        proxy_pass http://127.0.0.1:$server_port/origin;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+brotli filter body: no-transform fixture text line
+--- no_error_log
+[error]
