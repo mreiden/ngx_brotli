@@ -188,9 +188,14 @@ if [ "$ngx_module_link" != DYNAMIC ]; then
         next=ngx_http_range_header_filter_module
     fi
 
-    HTTP_FILTER_MODULES=`echo $HTTP_FILTER_MODULES \
-                         | sed "s/$ngx_module_name//" \
-                         | sed "s/$next/$next $ngx_module_name/"`
+    # Token-exact (the compression config's hardened form,
+# CodeRabbit on the graft): pad with spaces so a third-party filter
+# whose name CONTAINS this module's name or $next as a substring
+# is never silently mangled into a broken filter list.
+HTTP_FILTER_MODULES=`echo " $HTTP_FILTER_MODULES " \
+                     | sed "s/ $ngx_module_name / /" \
+                     | sed "s/ $next / $next $ngx_module_name /" \
+                     | sed "s/^ *//;s/ *\$//"`
 fi
 
 # Branch on NGX_CC_NAME, not the historical NGX_MSVC_VER: nginx removed

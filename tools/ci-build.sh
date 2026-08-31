@@ -41,7 +41,7 @@ if [ -z "$VERSION" ]; then
     # mainline tarball, so a hardcoded version eventually 404s.
     VERSION="$(curl -fsSL https://nginx.org/en/download.html |
         grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' |
-        sort -V | tail -1)"
+        sort -V | tail -1 || true)"
     if [ -z "$VERSION" ]; then
         echo "ERROR: could not resolve mainline nginx version from nginx.org" >&2
         exit 1
@@ -62,7 +62,10 @@ echo "== ngx_brotli build: mode=$MODE nginx=$VERSION tree=$SRCDIR"
 mkdir -p "$ROOT"
 
 if [ "$NO_CACHE" = "1" ]; then
-    rm -rf "$SRCDIR" "$TARBALL"
+    # deps/brotli/out too (CodeRabbit on the graft): the bundled-mode
+    # static lib is exactly what you are trying to rebuild when you
+    # reach for NO_CACHE=1 on a bundled link failure
+    rm -rf "$SRCDIR" "$TARBALL" "$MODULE_DIR/deps/brotli/out"
 fi
 
 if [ ! -f "$TARBALL" ]; then
@@ -76,6 +79,7 @@ if [ ! -f "${TARBALL}.asc" ]; then
 fi
 
 gnupghome="$(mktemp -d)"
+trap 'rm -rf "$gnupghome"' EXIT
 export GNUPGHOME="$gnupghome"
 chmod 700 "$gnupghome"
 shopt -s nullglob
@@ -87,7 +91,13 @@ if [ ${#keyfiles[@]} -eq 0 ]; then
     exit 1
 fi
 for keyfile in "${keyfiles[@]}"; do
-    gpg --quiet --import "$keyfile" 2>/dev/null
+    # LOUD on failure (CodeRabbit on the graft): a corrupt vendored key
+    # is a supply-chain trust-root problem and must not die silently
+    # under set -e with its diagnostics eaten
+    gpg --import "$keyfile" || {
+        echo "ERROR: importing $keyfile failed" >&2
+        exit 1
+    }
 done
 
 if gpg --quiet --verify "${TARBALL}.asc" "$TARBALL"; then
@@ -154,7 +164,18 @@ fi
     ${san_ld:+"$san_ld"} \
     --add-module="$MODULE_DIR" > /dev/null
 
-make -j"$(nproc)" 2>&1 | tail -3
+# quiet on success, the WHOLE tail on failure (CodeRabbit on the graft):
+# tail -3 kept only the make trailer, never the diagnostic -- and this
+# module links two different brotli sources across two build modes, so
+# link errors are the expected failure class here
+build_log="$(mktemp)"
+if ! make -j"$(nproc)" > "$build_log" 2>&1; then
+    tail -60 "$build_log"
+    rm -f "$build_log"
+    exit 1
+fi
+tail -3 "$build_log"
+rm -f "$build_log"
 
 test -f objs/nginx
 ./objs/nginx -V 2>&1

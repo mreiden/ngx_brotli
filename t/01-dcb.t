@@ -51,7 +51,11 @@ my $dict_raw = do {
     <$fh>;
 };
 our $dict_b64 = encode_base64(sha256($dict_raw), "");
-our $bad_b64  = encode_base64("\x01" x 32, "");
+# DISTINCT from $odd_hex/$odd_b64 below (CodeRabbit on the graft):
+# this one means "a hash the server does NOT hold", the odd pair
+# means "a wrong hash the server DOES declare" -- one byte string
+# must not play both roles.
+our $bad_b64  = encode_base64("\x02" x 32, "");
 
 # For the optional supplied-hash directive argument: the fixture's true
 # hash as hex, and a deliberately different well-formed hash. Supplying

@@ -66,6 +66,8 @@ jobs:
     steps:
       - name: Checkout module (no submodule — system mode must not need it)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -196,6 +198,8 @@ jobs:
     steps:
       - name: Checkout module (no submodule — system mode must not need it)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -261,6 +265,7 @@ jobs:
       - name: Checkout module with submodule
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           submodules: true
 
       # no libbrotli-dev on purpose — the fallback must build without it

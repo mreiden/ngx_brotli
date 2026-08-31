@@ -16,7 +16,10 @@ if [ ! -d logs ]; then
 fi
 
 # Download sample texts.
-curl --compressed -o $FILES/war-and-peace.txt http://www.gutenberg.org/files/2600/2600-0.txt
+# -fL + https (CodeRabbit on the graft): without -f a 404 stores an HTML
+# error page as the fixture and the suite "passes" against it; gutenberg
+# redirects plain http, so without -L the body is the redirect notice.
+curl -fsSL --compressed -o $FILES/war-and-peace.txt https://www.gutenberg.org/files/2600/2600-0.txt
 echo "Kot lomom kolol slona!" > $FILES/small.txt
 echo "<html>Kot lomom kolol slona!</html>" > $FILES/small.html
 

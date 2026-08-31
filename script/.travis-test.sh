@@ -157,8 +157,8 @@ $NGINX -c $ROOT/script/test_h2.conf -s stop
 
 # Report.
 
-FAILED=$(get_failed $STATUS)
-COUNT=$(get_count $STATUS)
+FAILED=$(get_failed)
+COUNT=$(get_count)
 echo $HR
 echo "Results: $FAILED of $COUNT tests failed"
 

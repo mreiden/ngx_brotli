@@ -35,7 +35,7 @@ cd fuzz
 A crash drops a `crash-*` reproducer. Replay it with:
 
 ```bash
-./../fuzz_accept_encoding crash-<hash>
+./fuzz_accept_encoding crash-<hash>   # from fuzz/, where build.sh puts it
 ```
 
 ## CI
