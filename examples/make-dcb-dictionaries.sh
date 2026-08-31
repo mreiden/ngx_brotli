@@ -71,7 +71,24 @@ for app in "${APPS[@]}"; do
     done
 done
 
-# Finished. Move tmp config into place and reload nginx for it to take
-# effect.
+# Finished. VALIDATE before the tmp file becomes the live include
+# (CodeRabbit on the graft): with mv-then-test, a broken include is
+# already in place when nginx -t fails -- the running nginx keeps
+# serving from its loaded config, nobody notices, and the next reboot
+# or package-upgrade restart fails to start nginx days after the
+# deploy that caused it. Roll back on failure instead.
+if [ -f "$CONF" ]; then
+    cp -p "$CONF" "$CONF.bak"
+fi
 mv "$CONF.tmp" "$CONF"
-nginx -t && nginx -s reload
+if ! nginx -t; then
+    if [ -f "$CONF.bak" ]; then
+        mv "$CONF.bak" "$CONF"
+    else
+        : > "$CONF"
+    fi
+    echo "nginx -t failed; dictionary include rolled back" >&2
+    exit 1
+fi
+rm -f "$CONF.bak"
+nginx -s reload
