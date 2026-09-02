@@ -109,10 +109,12 @@ typedef struct {
   /* Payload length; -1, if unknown. */
   off_t content_length;
 
-  /* (uncompressed) bytes pushed to encoder. */
-  size_t bytes_in;
+  /* (uncompressed) bytes pushed to encoder. uint64_t, not size_t (zstd
+     siblings' #200 row m7): on ILP32 a size_t wraps at 4 GiB and silently
+     corrupts $brotli_ratio for larger streamed responses. */
+  uint64_t bytes_in;
   /* (compressed) bytes pulled from encoder. */
-  size_t bytes_out;
+  uint64_t bytes_out;
 
   /* Input buffer chain. */
   ngx_chain_t* in;
@@ -903,11 +905,23 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
        runaway response. */
     if (conf->max_length != NGX_CONF_UNSET &&
         (off_t)ctx->bytes_in > (off_t)conf->max_length) {
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "brotli: input exceeded brotli_max_length (%z) on a "
-                    "response with no (honest) Content-Length; aborting to "
-                    "protect the worker",
-                    conf->max_length);
+      /* Name the shape truthfully (zstd siblings' #283): a declared length
+         the stream then overran is a misdeclaring upstream, not a chunked
+         one, and the operator's remedy differs. */
+      if (ctx->content_length >= 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "brotli: input exceeded brotli_max_length (%z) after "
+                      "%uL bytes on a response with declared "
+                      "Content-Length %O; aborting to protect the "
+                      "worker",
+                      conf->max_length, ctx->bytes_in, ctx->content_length);
+      } else {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "brotli: input exceeded brotli_max_length (%z) after "
+                      "%uL bytes on a response with no "
+                      "Content-Length; aborting to protect the worker",
+                      conf->max_length, ctx->bytes_in);
+      }
       ngx_http_brotli_filter_close(ctx);
       return NGX_ERROR;
     }
@@ -1355,6 +1369,69 @@ static ngx_int_t ngx_http_brotli_dcb_dicts_hashed_variable(
   return NGX_OK;
 }
 
+/* Split bytes_in/bytes_out into an integer part and THREE exact fractional
+   digits without ever overflowing uint64_t (zstd siblings' #294). Either
+   counter can approach UINT64_MAX on a long-lived connection, and
+   bytes_out may exceed bytes_in whenever the encoder expands
+   incompressible input. `bytes_in * 100 / bytes_out` wraps in the
+   multiply; dividing first and scaling only the remainder still wraps
+   when bytes_out > bytes_in, because the remainder is then bytes_in
+   itself. Exact long division instead: per digit the remainder (always
+   < divisor) is multiplied by 10, and when that product would not fit,
+   whole divisors are peeled off remainder * 10 by addition so nothing
+   leaves uint64_t -- the result matches an exact 128-bit
+   bytes_in * 1000 / bytes_out for every input pair
+   (tools/test_ratio_scaling_unit.sh extracts this verbatim and checks
+   it against that oracle). The caller rounds the third digit away. */
+static void ngx_http_brotli_ratio_parts(uint64_t bytes_in, uint64_t bytes_out,
+                                        ngx_uint_t* ratio_int,
+                                        ngx_uint_t* ratio_frac) {
+  uint64_t remainder, frac;
+  int i;
+
+  *ratio_int = (ngx_uint_t)(bytes_in / bytes_out);
+
+  remainder = bytes_in % bytes_out;
+  frac = 0;
+
+  for (i = 0; i < 3; i++) {
+    if (remainder <= UINT64_MAX / 10) {
+      remainder *= 10;
+      frac = frac * 10 + remainder / bytes_out;
+      remainder %= bytes_out;
+      continue;
+    }
+
+    /* remainder * 10 would overflow. Since remainder < bytes_out, that only
+       happens for a very large divisor; then remainder * 10 is at most
+       10 * bytes_out, so the quotient digit is in [0, 10) and can be found
+       exactly without forming the product: peel off whole multiples of
+       bytes_out from remainder * 10 one at a time, each step staying inside
+       uint64_t. */
+    {
+      uint64_t acc = remainder;
+      uint64_t digit = 0;
+      int k;
+
+      /* acc accumulates remainder * 10 modulo bytes_out. */
+      for (k = 0; k < 9; k++) {
+        acc += remainder;
+
+        if (acc >= bytes_out || acc < remainder) {
+          /* wrapped past, or reached, one whole bytes_out */
+          acc -= bytes_out;
+          digit++;
+        }
+      }
+
+      frac = frac * 10 + digit;
+      remainder = acc;
+    }
+  }
+
+  *ratio_frac = (ngx_uint_t)frac;
+}
+
 static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
                                                 uintptr_t data) {
@@ -1374,21 +1451,24 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
     return NGX_OK;
   }
 
-  v->data = ngx_pnalloc(r->pool, NGX_INT32_LEN + 3);
+  v->data = ngx_pnalloc(r->pool, NGX_INT64_LEN + 3);
   if (v->data == NULL) {
     return NGX_ERROR;
   }
 
-  ratio_int = (ngx_uint_t)(ctx->bytes_in / ctx->bytes_out);
-  ratio_frac = (ngx_uint_t)((ctx->bytes_in * 100 / ctx->bytes_out) % 100);
+  ngx_http_brotli_ratio_parts(ctx->bytes_in, ctx->bytes_out, &ratio_int,
+                              &ratio_frac);
 
-  /* Rounding; e.g. 2.125 to 2.13 */
-  if ((ctx->bytes_in * 1000 / ctx->bytes_out) % 10 > 4) {
-    ratio_frac++;
+  /* Two decimals, rounded half-up on the exact third digit, as this
+     variable has always printed; e.g. 2.125 to 2.13. */
+  if (ratio_frac % 10 > 4) {
+    ratio_frac = ratio_frac / 10 + 1;
     if (ratio_frac > 99) {
       ratio_int++;
       ratio_frac = 0;
     }
+  } else {
+    ratio_frac /= 10;
   }
 
   v->len = ngx_sprintf(v->data, "%ui.%02ui", ratio_int, ratio_frac) - v->data;
