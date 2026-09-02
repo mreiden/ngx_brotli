@@ -176,6 +176,12 @@ jobs:
       - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
         run: bash tools/test_read_dict_file_unit.sh
 
+      - name: Ratio scaling unit oracle (overflow-safe $brotli_ratio)
+        run: bash tools/test_ratio_scaling_unit.sh
+
+      - name: max_length abort diagnostics contract (declared vs unknown length)
+        run: bash tools/test_max_length_diagnostics.sh
+
   # ── ASan+UBSan over the chain-state paths ──────────────────────────────
   # The zstd siblings' round-4 lesson, applied here: the filter's buffer
   # and state-machine code never ran under a sanitizer, and their job's
