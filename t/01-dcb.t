@@ -65,21 +65,52 @@ our $dict_hex = unpack("H*", sha256($dict_raw));
 our $odd_hex  = "01" x 32;
 our $odd_b64  = encode_base64("\x01" x 32, "");
 
-# strict-walk fixtures (zstd siblings #165/#199): an out-of-repo tempdir
-# whose ABSOLUTE path goes into the config verbatim — a real directory,
-# a dictionary inside it, and a symlinked alias to the directory. A
-# tempdir rather than t/suite deliberately: the walk's ownership and
-# mode checks see real ext4 permissions there, not a mount's blanket
-# 0777 metadata.
+# strict-walk fixtures (zstd siblings #165/#199/#316): an out-of-repo
+# tempdir whose ABSOLUTE path goes into the config verbatim — a real
+# directory, a dictionary inside it, a symlinked alias to the directory,
+# and a world-writable and a sticky world-writable parent the walk must
+# refuse as ancestors. A tempdir rather than t/suite deliberately: the
+# walk's ownership and mode checks see real ext4 permissions there, not
+# a mount's blanket 0777 metadata.
+#
+# NOT under /tmp: /tmp is 1777, and the walk vets every ancestor, so a
+# fixture there would fail its positive control for /tmp's sake. The
+# tempdir goes under $HOME and the whole ancestor chain is checked to be
+# root- or self-owned and not group/world-writable; a host where it is
+# not skips the walk tests (skip_eval) instead of failing them for a
+# reason that is not what they test.
 use File::Temp qw(tempdir);
-our $walkdir = tempdir(CLEANUP => 1);
-mkdir "$walkdir/real" or die "mkdir: $!";
-{
+use File::Basename qw(dirname);
+our $walkdir;
+our $have_walk = eval {
+    my $base = $ENV{HOME};
+    die "no HOME for a vetted fixture base\n" unless defined $base && -d $base;
+    $walkdir = tempdir(DIR => $base, CLEANUP => 1);
+    for (my $d = $walkdir; ; $d = dirname($d)) {
+        my @st = stat($d) or die "stat $d: $!";
+        die "ancestor $d owned by uid $st[4], neither root nor uid $>\n"
+            if $st[4] != 0 && $st[4] != $>;
+        die sprintf("ancestor %s is mode %04o, writable by group or other\n", $d, $st[2] & 07777)
+            if $st[2] & 022;
+        last if $d eq '/';
+    }
+    mkdir "$walkdir/real" or die "mkdir: $!";
     open my $h, '>', "$walkdir/real/w.dict" or die "spew: $!";
     print $h "strict walk fixture dictionary contents\n" x 20;
     close $h;
-}
-symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
+    symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
+    for my $arm (['open', 0777], ['sticky', 01777]) {
+        my ($name, $mode) = @$arm;
+        mkdir "$walkdir/$name" or die "mkdir $name: $!";
+        open my $f, '>', "$walkdir/$name/w.dict" or die "spew $name: $!";
+        print $f "strict walk fixture dictionary contents\n" x 20;
+        close $f;
+        chmod $mode, "$walkdir/$name" or die "chmod $name: $!";
+        my @st = stat("$walkdir/$name");
+        die "chmod $name did not stick\n" if ($st[2] & 07777) != $mode;
+    }
+    1;
+} || 0;
 
 no_long_string();
 log_level 'warn';
@@ -581,6 +612,7 @@ Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 # ownership check, or the writable-target check. Rejecting the ordering
 # beats re-opening every dictionary post-parse (the TOCTOU window the
 # fstat-after-open checks close).
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "brotli_dcb_dict_file $::walkdir/real/w.dict;
  brotli_dcb_dict_strict_path on;"
@@ -597,6 +629,7 @@ Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 # Positive control for TESTs 23/25/26: identical file, symlink-free
 # absolute chain, sanctioned order — the walk verifies every component,
 # the ownership and mode checks pass, and the server starts.
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "brotli_dcb_dict_strict_path on;
  brotli_dcb_dict_file $::walkdir/real/w.dict;"
@@ -614,6 +647,7 @@ ok
 === TEST 25: strict mode refuses a ".." path component
 # zstd sibling #199 (M3): ".." would climb back above a component the
 # walk already verified — refused rather than resolved.
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "brotli_dcb_dict_strict_path on;
  brotli_dcb_dict_file $::walkdir/real/../real/w.dict;"
@@ -632,6 +666,7 @@ contains a "." or ".." component
 # straight through the old check (which here was NO check at all). The
 # component walk refuses the symlink where it sits; the same file
 # loads through its real chain in TEST 24.
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "brotli_dcb_dict_strict_path on;
  brotli_dcb_dict_file $::walkdir/link/w.dict;"
@@ -642,6 +677,61 @@ contains a "." or ".." component
 a symlink at any component is refused
 --- no_error_log
 [alert]
+
+
+=== TEST 26a: strict mode refuses a world-writable PARENT directory
+# zstd sibling #316 (A33-F2): both leaf checks pass — the file is
+# self-owned 0644 — but its parent is 0777, so any local user could
+# rename() a different file into the leaf position; the walk refuses
+# the ancestor, not the leaf. TEST 26c loads the identical file with
+# strict off.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"brotli_dcb_dict_strict_path on;
+ brotli_dcb_dict_file $::walkdir/open/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+directory component "open" of
+writable by group or other
+--- no_error_log
+[alert]
+
+
+=== TEST 26b: strict mode refuses a STICKY world-writable parent too
+# zstd sibling #316: no sticky-bit exemption. A 1777 parent stops other
+# users deleting the file, but still lets any of them create the next
+# path component beside it — the steering the walk exists to refuse.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"brotli_dcb_dict_strict_path on;
+ brotli_dcb_dict_file $::walkdir/sticky/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+directory component "sticky" of
+no sticky-bit exemption
+--- no_error_log
+[alert]
+
+
+=== TEST 26c: the same file under the world-writable parent loads with strict off
+# Positive control for 26a/26b: default mode leaf-checks the file only,
+# so the ancestor's mode is not its concern and the server starts.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"brotli_dcb_dict_file $::walkdir/open/w.dict;"
+--- config
+    location /t { return 200 "ok\n"; }
+--- request
+GET /t
+--- error_code: 200
+--- response_body
+ok
+--- no_error_log
+[error]
 
 
 === TEST 27: a non-regular dictionary path is FATAL, unconditionally

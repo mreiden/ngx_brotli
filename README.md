@@ -132,8 +132,11 @@ against current nginx. Differences from upstream:
   symlink **anywhere** in it — including a `current -> releases/N`
   deploy layout, which is why the default stays off — is refused
   rather than followed, `.`/`..` components are rejected, and the file
-  must be owned by the loading principal (or root) and not writable by
-  group or other. The directive must precede every
+  and every directory on the way to it must be owned by the loading
+  principal (or root) and not writable by group or other (no sticky-bit
+  exemption, so a dictionary under `/tmp` is refused: an ancestor a
+  local user can write into lets that user rename a file of their
+  choosing into the leaf's place). The directive must precede every
   `brotli_dcb_dict_file` it applies to; declaring it after one is a
   config-load error rather than a silently unvetted load. Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.
