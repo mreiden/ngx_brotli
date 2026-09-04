@@ -266,9 +266,20 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
  * that actually holds the dictionary can decode a dictionary-compressed
  * response, so a blanket "*" must not turn it on).
  */
+/*
+ * The _ex form also reports the two accumulated weights it computed
+ * anyway (zstd sibling #315): *explicit_q is the latest explicit
+ * `coding` token's weight and *star_q_out the latest "*" weight, each
+ * -1 when that form is absent. The request walker below needs both to
+ * compose duplicate field lines, and taking them from one pass keeps it
+ * from parsing the same line a second time. The return value is exactly
+ * the precedence rule applied to them, so ngx_http_brotli_coding_weight()
+ * below stays byte-for-byte the function the fuzz oracle asserts.
+ */
 static ngx_int_t
-ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
-    size_t coding_len, ngx_uint_t allow_wildcard)
+ngx_http_brotli_coding_weight_ex(ngx_str_t *ae, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard, ngx_int_t *explicit_q,
+    ngx_int_t *star_q_out)
 {
     u_char     *p   = ae->data;
     u_char     *end = ae->data + ae->len;
@@ -355,6 +366,9 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
         }
     }
 
+    *explicit_q = coding_q;
+    *star_q_out = star_q;
+
     /*
      * An explicit token decides the result (even q=0, which then
      * overrides a permissive "*"). With no explicit token, the "*"
@@ -371,6 +385,23 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
 
 
 /*
+ * Effective weight for `coding` in one field value, the per-form
+ * weights discarded. This is the signature the fuzz differential and
+ * the extracted parser link against.
+ */
+static ngx_int_t
+ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t  explicit_q, star_q;
+
+    return ngx_http_brotli_coding_weight_ex(ae, coding, coding_len,
+                                            allow_wildcard,
+                                            &explicit_q, &star_q);
+}
+
+
+/*
  * Whole-request weight lookup: multiple Accept-Encoding lines are
  * semantically ONE comma-joined field (RFC 9110 section 5.3), so the
  * lines accumulate under the same precedence the single-value walker
@@ -380,9 +411,10 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
  * on the second, and would honour an allowance a later line revoked
  * with q=0 — divergence any comma-joining intermediary makes visible.
  *
- * The per-line probe runs twice: first wildcard-suppressed, so an
- * explicit token's verdict (including q=0) is isolated from a "*" on
- * the same line, then as-asked to collect the wildcard.
+ * The per-line probe runs once, through the parser's _ex form, which
+ * reports an explicit token's verdict (including q=0) and the "*"
+ * weight separately (zstd sibling #315; the earlier shape probed twice
+ * and re-scanned every line that named no explicit token).
  *
  * nginx >= 1.23 chains same-name headers through ngx_table_elt_t.next;
  * older cores keep only the first line in headers_in.accept_encoding,
@@ -401,21 +433,19 @@ ngx_http_brotli_fold_line_weight(ngx_str_t *value, const char *coding,
     size_t coding_len, ngx_uint_t allow_wildcard, ngx_int_t *coding_q,
     ngx_int_t *star_q)
 {
-    ngx_int_t  q;
+    ngx_int_t  line_coding_q, line_star_q;
 
-    q = ngx_http_brotli_coding_weight(value, coding, coding_len, 0);
-    if (q >= 0) {
-        *coding_q = q;      /* comma-joined in received order */
+    (void) ngx_http_brotli_coding_weight_ex(value, coding, coding_len,
+                                            allow_wildcard,
+                                            &line_coding_q, &line_star_q);
+
+    if (line_coding_q >= 0) {
+        *coding_q = line_coding_q;  /* comma-joined in received order */
         return;
     }
 
-    if (!allow_wildcard) {
-        return;
-    }
-
-    q = ngx_http_brotli_coding_weight(value, coding, coding_len, 1);
-    if (q >= 0) {
-        *star_q = q;        /* only "*" could answer here */
+    if (allow_wildcard && line_star_q >= 0) {
+        *star_q = line_star_q;
     }
 }
 
